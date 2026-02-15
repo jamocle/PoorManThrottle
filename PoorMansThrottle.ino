@@ -11,6 +11,63 @@
   Target: ESP32-WROOM-32 (Arduino framework)
   Motor driver: IBT-2 / BTS7960 (RPWM/LPWM)
   BLE: Custom service with RX (Write / WriteNR) + TX (Notify)
+
+    ------------------------- BLE COMMAND REFERENCE -------------------------
+
+  Notes:
+  - Commands are case-insensitive.
+  - Whitespace + CR/LF are trimmed.
+  - For most commands, ESP32 responds via TX Notify with:
+      ACK:<original command>   (valid)
+      ERR:<original command>   (invalid)
+    Help sends ACK first, then multiple MENU: lines.
+  - Throttle values are clamped to 0..100.
+  - Stop-first reversing is enforced (ramps to 0, wait 250ms, then reverse).
+
+  MOTION (Momentum / Nonlinear Ramp)
+  - F<n>        : Forward to throttle n (0..100) using momentum ramp (smoothstep)
+                Accel full-scale=10s, Decel full-scale=6s
+                Example: F40
+  - R<n>        : Reverse to throttle n (0..100) using momentum ramp
+                Example: R25
+
+  MOTION (Instant)
+  - FQ<n>       : Forward immediate to throttle n (0..100)
+                If reversing, performs quick-stop ramp -> 250ms -> jump
+                Example: FQ60
+  - RQ<n>       : Reverse immediate to throttle n (0..100)
+                Example: RQ60
+
+  STOPS
+  - S           : Quick stop ramp to 0 (full-scale 1.5s)
+  - B           : Brake ramp to 0 (full-scale 4.0s)
+
+  START ASSIST CONFIG
+  - M<n>        : MINSTART-Set minimum starting throttle (0..100)
+                Applied ONLY when starting from stop; does NOT block decel below it
+                Example: M15
+  - K<t>,<ms>   : KICK-Set start kick throttle and duration
+                t = 0..100, ms = 0..2000
+                When starting from stop with target > 0, apply max(t, MINSTART) for ms,
+                then continue ramp/instant behavior
+                Example: K60,200
+
+  DEBUG (Serial only)
+  - D<n>        : n=1 Debug ON (prints FW name/version, BLE MTU, events)
+                : n=0 Debug OFF
+
+  HELP (BLE Notify output)
+  - H  or H1    : HELP1 (compact). Sends ACK then multiple MENU: lines
+  - H2          : HELP2 (detailed). Sends ACK then multiple MENU: lines
+
+  EXTRA COMMANDS IN THIS BUILD (your additions)
+  - ?           : State query (returns raw state text via notify; NO ACK/ERR wrapper)
+                Returns one of:
+                    STOPPED
+                    FORWARD <appliedThrottle>
+                    REVERSE <appliedThrottle>
+  - V           : Version query (responds as ACK:<FW_VERSION>)
+                Example: V  ->  ACK:1.0.6
 */
 
 #include <Arduino.h>
@@ -19,7 +76,7 @@
 
 // ------------------------- Firmware ID -------------------------
 static const char* FW_NAME    = "GScaleThrottle";
-static const char* FW_VERSION = "1.0.0";
+static const char* FW_VERSION = "1.0.7";
 
 // ------------------------- Strict no-float guard (compile-time) -------------------------
 #ifndef DISABLE_STRICT_NO_FLOAT_GUARD
@@ -114,12 +171,15 @@ static uint16_t g_peerMtu = 23;  // default
 static const int LED_PIN = 2;
 
 // Blink timing while disconnected
-static const uint32_t LED_BLINK_ON_MS  = 500;
-static const uint32_t LED_BLINK_OFF_MS = 500;
+// Disconnected search pattern timing
+static const uint16_t LED_SEARCH_ON_1_MS   = 70;
+static const uint16_t LED_SEARCH_GAP_MS    = 90;
+static const uint16_t LED_SEARCH_ON_2_MS   = 70;
+static const uint16_t LED_SEARCH_PAUSE_MS  = 700;
 
 // Dip timing (brief OFF) on activity while connected
-static const uint16_t LED_DIP_MS_RX = 35;
-static const uint16_t LED_DIP_MS_TX = 20;
+static const uint16_t LED_DIP_MS_RX = 150;
+static const uint16_t LED_DIP_MS_TX = 100;
 
 static bool     ledIsOn = false;
 static uint32_t ledNextToggleMs = 0;
@@ -175,17 +235,37 @@ static inline void ledService() {
     return;
   }
 
-  // 2) If disconnected: blinking
+    // 2) If disconnected: double-blink search pattern
   ledDipActive = false; // no dips in blink mode
+
+  static uint8_t searchStep = 0;
 
   if ((int32_t)(now - ledNextToggleMs) < 0) return;
 
-  if (ledIsOn) {
-    ledWrite(false);
-    ledNextToggleMs = now + LED_BLINK_OFF_MS;
-  } else {
-    ledWrite(true);
-    ledNextToggleMs = now + LED_BLINK_ON_MS;
+  switch (searchStep) {
+    case 0:
+      ledWrite(true);
+      ledNextToggleMs = now + LED_SEARCH_ON_1_MS;
+      searchStep = 1;
+      break;
+
+    case 1:
+      ledWrite(false);
+      ledNextToggleMs = now + LED_SEARCH_GAP_MS;
+      searchStep = 2;
+      break;
+
+    case 2:
+      ledWrite(true);
+      ledNextToggleMs = now + LED_SEARCH_ON_2_MS;
+      searchStep = 3;
+      break;
+
+    default: // pause
+      ledWrite(false);
+      ledNextToggleMs = now + LED_SEARCH_PAUSE_MS;
+      searchStep = 0;
+      break;
   }
 }
 
@@ -259,6 +339,20 @@ static void stopMotorNow(const char* reason) {
     Serial.print("[STOP] ");
     Serial.println(reason);
   }
+}
+
+static String getStateString() {
+  // Momentary state: based on currentDirection + appliedThrottle (not target)
+  if (appliedThrottle <= 0 || currentDirection == Direction::STOP) {
+    return "STOPPED";
+  }
+  if (currentDirection == Direction::FWD) {
+    return "FORWARD " + String(appliedThrottle);
+  }
+  if (currentDirection == Direction::REV) {
+    return "REVERSE " + String(appliedThrottle);
+  }
+  return "STOPPED";
 }
 
 // ------------------------- MTU-aware BLE notify (chunked) -------------------------
@@ -608,16 +702,18 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     bool allowMotionNow = !(forcedStopLatched && !bleConnected);
 
     // HELP
-    if (upper == "?" || upper == "?1") {
+    if (upper == "H" || upper == "H1") {
       sendACK(preserved);
       sendMENU("F<n> R<n>: momentum 0-100");
       sendMENU("FQ<n> RQ<n>: instant 0-100");
       sendMENU("S: quick stop  B: brake");
-      sendMENU("MINSTART<n>  KICK<t>,<ms>");
-      sendMENU("D1 debug on  D0 off  ?2 more");
+      sendMENU("M<n>  K<t>,<ms>");
+      sendMENU("?: State");
+      sendMENU("V: Version");
+      sendMENU("D1 debug on  D0 off  H2 more");
       return;
     }
-    if (upper == "?2") {
+    if (upper == "H2") {
       sendACK(preserved);
       sendMENU("F<n>: ramp forward to n (smooth)");
       sendMENU("R<n>: ramp reverse to n (smooth)");
@@ -625,10 +721,24 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       sendMENU("FQ/RQ: quick-stop, wait, jump");
       sendMENU("S: quick stop 1.5s full-scale");
       sendMENU("B: brake 4.0s full-scale");
-      sendMENU("MINSTART: only when starting");
-      sendMENU("KICK: hold then ramp/jump");
+      sendMENU("M: only when starting");
+      sendMENU("K: hold then ramp/jump");
+      sendMENU("?: State");
+      sendMENU("V: Version");
       sendMENU("D1/D0: Serial debug only");
       return;
+    }
+
+    // STATE (no ACK, raw response only)
+    if (upper == "?") {
+        bleNotifyChunked(getStateString());
+        return;
+    }
+
+    // VERSION
+    if(upper == "V") {
+        sendACK(String(FW_VERSION));
+        return;
     }
 
     // DEBUG
@@ -656,18 +766,18 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     }
 
     // MINSTART
-    if (upper.startsWith("MINSTART")) {
-      String nStr = original.substring(String("MINSTART").length());
+    if (upper.startsWith("M")) {
+      String nStr = original.substring(String("M").length());
       nStr.trim();
       if (!isDigitStr(nStr)) { sendERR(preserved); return; }
       cfgMinStart = clampI32(nStr.toInt(), 0, 100);
-      if (debugMode) { Serial.print("[CFG] MINSTART="); Serial.println(cfgMinStart); }
+      if (debugMode) { Serial.print("[CFG] M="); Serial.println(cfgMinStart); }
       sendACK(preserved);
       return;
     }
 
     // KICK<t>,<ms>
-    if (upper.startsWith("KICK")) {
+    if (upper.startsWith("K")) {
       String args = original.substring(4);
       args.trim();
       int comma = args.indexOf(',');
