@@ -1,5 +1,5 @@
 /*
-  (C) James Theimer 2026
+  (C) James Theimer 2026 Poor Man's Throttle
   ESP32 BLE Heavy-Train Throttle Controller (FINAL SPEC)
 
   LED behavior (GPIO2) — per your request:
