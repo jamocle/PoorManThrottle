@@ -66,6 +66,7 @@
                     STOPPED
                     FORWARD <appliedThrottle>
                     REVERSE <appliedThrottle>
+  - G           : last 3 digits of the GUID
   - V           : Version query (responds as ACK:<FW_VERSION>)
                 Example: V  ->  ACK:1.0.6
 */
@@ -76,7 +77,12 @@
 
 // ------------------------- Firmware ID -------------------------
 static const char* FW_NAME    = "GScaleThrottle";
-static const char* FW_VERSION = "1.0.7";
+static const char* FW_VERSION = "1.0.8.1";
+
+// ------------------------- BLE UUIDs (custom) -------------------------
+static const char* SERVICE_UUID = "9b2b7b30-5f3d-4a51-9bd6-1e8cde2c9000";
+static const char* RX_UUID      = "9b2b7b31-5f3d-4a51-9bd6-1e8cde2c9000"; // Write / WriteNR
+static const char* TX_UUID      = "9b2b7b32-5f3d-4a51-9bd6-1e8cde2c9000"; // Notify
 
 // ------------------------- Strict no-float guard (compile-time) -------------------------
 #ifndef DISABLE_STRICT_NO_FLOAT_GUARD
@@ -109,11 +115,6 @@ static const uint32_t FULL_BRAKE_MS          = 4000;
 static const uint32_t FULL_QUICKSTOP_MS      = 1500;
 static const uint32_t DIR_CHANGE_DELAY_MS    = 250;
 static const uint32_t BLE_GRACE_MS           = 10000;
-
-// ------------------------- BLE UUIDs (custom) -------------------------
-static const char* SERVICE_UUID = "9b2b7b30-5f3d-4a51-9bd6-1e8cde2c9a10";
-static const char* RX_UUID      = "9b2b7b31-5f3d-4a51-9bd6-1e8cde2c9a10"; // Write / WriteNR
-static const char* TX_UUID      = "9b2b7b32-5f3d-4a51-9bd6-1e8cde2c9a10"; // Notify
 
 // ------------------------- Motion/BLE state -------------------------
 static volatile bool debugMode = false;
@@ -710,6 +711,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       sendMENU("M<n>  K<t>,<ms>");
       sendMENU("?: State");
       sendMENU("V: Version");
+      sendMENU("G: Board Guid");
       sendMENU("D1 debug on  D0 off  H2 more");
       return;
     }
@@ -725,6 +727,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       sendMENU("K: hold then ramp/jump");
       sendMENU("?: State");
       sendMENU("V: Version");
+      sendMENU("G: Board Guid");
       sendMENU("D1/D0: Serial debug only");
       return;
     }
@@ -739,6 +742,16 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     if(upper == "V") {
         sendACK(String(FW_VERSION));
         return;
+    }
+
+    //GUID
+    if(upper == "G") {
+      String uuid = String(SERVICE_UUID);
+
+      // Extract last 17 characters: "9bd6-1e8cde2c9000"
+      String lastPart = uuid.substring(uuid.length() - 17);
+      bleNotifyChunked(lastPart);
+      return;
     }
 
     // DEBUG

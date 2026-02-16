@@ -148,7 +148,7 @@ ESP32 GND → IBT-2 GND (header)
 ## Provide IBT-2 Logic Supply
 
 ```text
-ESP32 5V → IBT-2 VCC
+ESP32 VIN → IBT-2 VCC
 ```
 
 ### Logic-Level Note
@@ -158,11 +158,22 @@ ESP32 5V → IBT-2 VCC
 - 3.3V HIGH is sufficient to drive RPWM and LPWM correctly  
 
 ## Enable Pins
+These are on the IBT-2 header.
 
 ```text
 R_EN → VCC
 L_EN → VCC
 ```
+Short jumper wires are fine.
+
+No ESP32 pins required for enables.
+
+## Verify
+IBT-2 VCC will have three connections tied together:
+```
+ESP32 VIN -> IBT-2 R_EN -> IBT-2 L_EN
+```
+All three connect to the same electrical point: VIN logic supply on the ESP32
 
 ## Additional Decoupling (Recommended)
 
@@ -174,10 +185,10 @@ Add a 100nF ceramic capacitor directly between IBT-2 VCC and GND at the header p
 
 | ESP32 Pin | IBT-2 Pin |
 |------------|------------|
-| GPIO25 | RPWM |
-| GPIO26 | LPWM |
+| GPIO25 (D25)| RPWM |
+| GPIO26 (D26)| LPWM |
 
-Leave R_IS and L_IS unconnected.
+**\*\*\* Leave R_IS and L_IS unconnected.**
 
 ---
 
