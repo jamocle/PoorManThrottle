@@ -77,7 +77,7 @@
 
 // ------------------------- Firmware ID -------------------------
 static const char* FW_NAME    = "GScaleThrottle";
-static const char* FW_VERSION = "1.0.8.1";
+static const char* FW_VERSION = "1.0.9";
 
 // ------------------------- BLE UUIDs (custom) -------------------------
 static const char* SERVICE_UUID = "9b2b7b30-5f3d-4a51-9bd6-1e8cde2c9000";
@@ -98,6 +98,8 @@ enum class PendingStage : uint8_t { NONE = 0, WAIT_DIR_DELAY };
 // ------------------------- Pins & PWM -------------------------
 static const int PIN_RPWM = 25;   // Forward PWM -> RPWM
 static const int PIN_LPWM = 26;   // Reverse PWM -> LPWM
+static const int PIN_REN = 27;  // IBT-2 R_EN
+static const int PIN_LEN = 33;  // IBT-2 L_EN
 
 static const uint32_t PWM_FREQ_HZ  = 20000;   // ~20kHz
 static const uint8_t  PWM_RES_BITS = 10;      // 8–10 bits allowed
@@ -301,24 +303,33 @@ static uint32_t throttleToDuty(int32_t thr) {
   return (uint32_t)((uint64_t)thr * (uint64_t)PWM_MAX_DUTY / 100ULL);
 }
 
+static inline void driverEnable(bool en) {
+  digitalWrite(PIN_REN, en ? HIGH : LOW);
+  digitalWrite(PIN_LEN, en ? HIGH : LOW);
+}
+
 static void applyPwmOutputs(Direction dir, int32_t thr) {
+  // Any zero-throttle condition should be a TRUE stop (coast/off)
+  if (thr <= 0 || dir == Direction::STOP) {
+    ledcWrite(PWM_CH_R, 0);
+    ledcWrite(PWM_CH_L, 0);
+    driverEnable(false);   // EN LOW = true off/coast (matches our voltage tests)
+    return;
+  }
+
   uint32_t duty = throttleToDuty(thr);
-  switch (dir) {
-    case Direction::FWD:
-      ledcWrite(PWM_CH_R, duty);
-      ledcWrite(PWM_CH_L, 0);
-      break;
-    case Direction::REV:
-      ledcWrite(PWM_CH_R, 0);
-      ledcWrite(PWM_CH_L, duty);
-      break;
-    case Direction::STOP:
-    default:
-      ledcWrite(PWM_CH_R, 0);
-      ledcWrite(PWM_CH_L, 0);
-      break;
+
+  if (dir == Direction::FWD) {
+    driverEnable(true);
+    ledcWrite(PWM_CH_R, duty);
+    ledcWrite(PWM_CH_L, 0);
+  } else { // REV
+    driverEnable(true);
+    ledcWrite(PWM_CH_R, 0);
+    ledcWrite(PWM_CH_L, duty);
   }
 }
+
 
 static void stopMotorNow(const char* reason) {
   appliedThrottle = 0;
@@ -335,6 +346,7 @@ static void stopMotorNow(const char* reason) {
   pendingStage = PendingStage::NONE;
 
   applyPwmOutputs(Direction::STOP, 0);
+  driverEnable(false);  // TRUE STOP: coast/off
 
   if (debugMode) {
     Serial.print("[STOP] ");
@@ -791,7 +803,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 
     // KICK<t>,<ms>
     if (upper.startsWith("K")) {
-      String args = original.substring(4);
+      String args = original.substring(1);
       args.trim();
       int comma = args.indexOf(',');
       if (comma < 0) { sendERR(preserved); return; }
@@ -883,6 +895,13 @@ static void setupPwm() {
   applyPwmOutputs(Direction::STOP, 0);
 }
 
+static void setupDriverPins() {
+  //Configure EN pins ----
+  pinMode(PIN_REN, OUTPUT);
+  pinMode(PIN_LEN, OUTPUT);
+  driverEnable(false);   // Start DISABLED (true coast/off)
+}
+
 static void setupBle() {
   NimBLEDevice::init(FW_NAME);
 
@@ -911,6 +930,7 @@ static void setupBle() {
 
 void setup() {
   ledInit();      // LED starts in "disconnected blink" mode by ledService()
+  setupDriverPins();
   setupPwm();
   stopMotorNow("Boot");
   setupBle();
