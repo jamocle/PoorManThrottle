@@ -75,6 +75,9 @@
 #include <NimBLEDevice.h>
 #include <type_traits>
 
+// ------------------------- Startup defaults -------------------------
+static const bool DEBUG_AT_STARTUP = true;  
+
 // ------------------------- Firmware ID -------------------------
 static const char* FW_NAME    = "GScaleThrottle";
 static const char* FW_VERSION = "1.0.9";
@@ -111,15 +114,16 @@ static const uint32_t PWM_MAX_DUTY = (1UL << PWM_RES_BITS) - 1;
 static const int32_t P_SCALE = 1000; // mandatory
 
 // ------------------------- Timing constants -------------------------
-static const uint32_t FULL_MOMENTUM_ACCEL_MS = 10000; // full-scale 100 step
-static const uint32_t FULL_MOMENTUM_DECEL_MS = 6000;
-static const uint32_t FULL_BRAKE_MS          = 4000;
-static const uint32_t FULL_QUICKSTOP_MS      = 1500;
-static const uint32_t DIR_CHANGE_DELAY_MS    = 250;
-static const uint32_t BLE_GRACE_MS           = 10000;
+static const uint32_t FULL_MOMENTUM_ACCEL_MS = 20000; // full-scale 100 step
+static const uint32_t FULL_MOMENTUM_DECEL_MS = 20000;
+static const uint32_t FULL_BRAKE_MS          = 10000;
+static const uint32_t FULL_QUICKSTOP_MS      = 3000;
+static const uint32_t DIR_CHANGE_DELAY_MS    = 2000;
+static const uint32_t BLE_GRACE_MS           = 15000;
+static const uint32_t GRACE_COUNTDOWN_LOG_PERIOD_MS = 1000; // log once per second in debug
 
 // ------------------------- Motion/BLE state -------------------------
-static volatile bool debugMode = false;
+static volatile bool debugMode = DEBUG_AT_STARTUP;
 
 static int32_t appliedThrottle = 0;      // 0..100
 static int32_t targetThrottle  = 0;      // 0..100
@@ -273,6 +277,11 @@ static inline void ledService() {
 }
 
 // ------------------------- Helpers -------------------------
+static inline void cancelPendingReverse() {
+  reversePending = false;
+  pendingStage = PendingStage::NONE;
+}
+
 static inline int32_t clampI32(int32_t v, int32_t lo, int32_t hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
@@ -296,6 +305,73 @@ static uint32_t scaledDurationMs(uint32_t fullScaleMs, int32_t deltaThrottleAbs)
 
 static void debugPrintln(const String& s) {
   if (debugMode) Serial.println(s);
+}
+
+// ------------------------- Throttle change logging -------------------------
+static int32_t lastLoggedAppliedThrottle = -9999;
+static Direction lastLoggedDirection = Direction::STOP;
+
+static const char* dirStr(Direction d) {
+  switch (d) {
+    case Direction::STOP: return "STOP";
+    case Direction::FWD:  return "FWD";
+    case Direction::REV:  return "REV";
+    default:              return "?";
+  }
+}
+
+static void logThrottleChangeIfNeeded(const char* reason) {
+  if (!debugMode) return;
+
+  if (appliedThrottle != lastLoggedAppliedThrottle ||
+      currentDirection != lastLoggedDirection) {
+
+    Serial.print("[THR] ");
+    Serial.print(reason);
+    Serial.print(" | dir=");
+    Serial.print(dirStr(currentDirection));
+    Serial.print(" applied=");
+    Serial.print(appliedThrottle);
+    Serial.print(" targetDir=");
+    Serial.print(dirStr(targetDirection));
+    Serial.print(" target=");
+    Serial.print(targetThrottle);
+    Serial.print(" ramp=");
+    Serial.print(rampActive ? "1" : "0");
+    Serial.print(" kick=");
+    Serial.print(kickActive ? "1" : "0");
+    Serial.print(" pending=");
+    Serial.print(reversePending ? "1" : "0");
+    Serial.print(" ble=");
+    Serial.print(bleConnected ? "1" : "0");
+    Serial.print(" latch=");
+    Serial.println(forcedStopLatched ? "1" : "0");
+
+    lastLoggedAppliedThrottle = appliedThrottle;
+    lastLoggedDirection = currentDirection;
+  }
+}
+
+static inline void setApplied(Direction dir, int32_t thr, const char* reason) {
+  thr = clampI32(thr, 0, 100);
+  currentDirection = (thr == 0) ? Direction::STOP : dir;
+  appliedThrottle  = thr;
+  logThrottleChangeIfNeeded(reason);
+}
+
+static inline void setTarget(Direction dir, int32_t thr, const char* reason) {
+  thr = clampI32(thr, 0, 100);
+  targetDirection = (thr == 0) ? Direction::STOP : dir;
+  targetThrottle  = thr;
+
+  if (debugMode) {
+    Serial.print("[TGT] ");
+    Serial.print(reason);
+    Serial.print(" | targetDir=");
+    Serial.print(dirStr(targetDirection));
+    Serial.print(" target=");
+    Serial.println(targetThrottle);
+  }
 }
 
 static uint32_t throttleToDuty(int32_t thr) {
@@ -332,10 +408,8 @@ static void applyPwmOutputs(Direction dir, int32_t thr) {
 
 
 static void stopMotorNow(const char* reason) {
-  appliedThrottle = 0;
-  targetThrottle = 0;
-  currentDirection = Direction::STOP;
-  targetDirection  = Direction::STOP;
+  setApplied(Direction::STOP, 0, reason);
+  setTarget(Direction::STOP, 0, "stopMotorNow target");
 
   rampActive = false;
   rampKind = RampKind::NONE;
@@ -346,7 +420,7 @@ static void stopMotorNow(const char* reason) {
   pendingStage = PendingStage::NONE;
 
   applyPwmOutputs(Direction::STOP, 0);
-  driverEnable(false);  // TRUE STOP: coast/off
+   driverEnable(false);  // TRUE STOP: coast/off
 
   if (debugMode) {
     Serial.print("[STOP] ");
@@ -430,8 +504,10 @@ static int32_t smoothstepEasedThrottle(int32_t startThr, int32_t targetThr, uint
 static void cancelAllMotionActivities() {
   rampActive = false;
   kickActive = false;
-  reversePending = false;
-  pendingStage = PendingStage::NONE;
+
+  // IMPORTANT:
+  // Do NOT clear reversePending / pendingStage here.
+  // Those are used to sequence stop-first reversing.
 }
 
 static void startRamp(Direction dirDuringRamp, int32_t startThr, int32_t endThr, uint32_t durationMs, RampKind kind) {
@@ -486,8 +562,7 @@ static void beginKick(Direction dir, int32_t finalTargetThr, bool afterKickIsIns
   kickHoldThrottle = kickThr;
   kickEndMs = millis() + (uint32_t)cfgKickMs;
 
-  appliedThrottle = kickHoldThrottle;
-  currentDirection = dir;
+  setApplied(dir, kickHoldThrottle, "KICK begin");
   applyPwmOutputs(currentDirection, appliedThrottle);
 
   reversePending = true;
@@ -497,17 +572,7 @@ static void beginKick(Direction dir, int32_t finalTargetThr, bool afterKickIsIns
   pendingFinalIsInstant = afterKickIsInstant;
   pendingFinalIsMomentum = afterKickIsMomentum;
 
-  targetDirection = (finalTargetThr == 0) ? Direction::STOP : dir;
-  targetThrottle  = finalTargetThr;
-
-  if (debugMode) {
-    Serial.print("[KICK] dir=");
-    Serial.print((dir == Direction::FWD) ? "FWD" : "REV");
-    Serial.print(" hold=");
-    Serial.print(kickHoldThrottle);
-    Serial.print("ms target=");
-    Serial.println(finalTargetThr);
-  }
+  setTarget(dir, finalTargetThr, "KICK target");
 }
 
 static void continueAfterKickIfNeeded() {
@@ -542,6 +607,7 @@ static void continueAfterKickIfNeeded() {
 
 // ------------------------- Motion command execution -------------------------
 static void executeStopRamp(RampKind kind) {
+  // Only cancel ramp/kick. Preserve reversePending sequencing.
   cancelAllMotionActivities();
 
   int32_t startThr = appliedThrottle;
@@ -553,8 +619,7 @@ static void executeStopRamp(RampKind kind) {
 
   uint32_t dur = scaledDurationMs(full, deltaAbs);
 
-  targetDirection = Direction::STOP;
-  targetThrottle  = 0;
+  setTarget(Direction::STOP, 0, "Stop ramp target");
 
   Direction dir = (currentDirection == Direction::STOP) ? Direction::STOP : currentDirection;
   startRamp(dir, startThr, 0, dur, kind);
@@ -571,18 +636,20 @@ static void scheduleReverseAfterStop(Direction finalDir, int32_t finalThr, bool 
 }
 
 static void executeInstant(Direction dir, int32_t requestedThr) {
+  // New motion command overrides any previously queued reverse
+  cancelPendingReverse();
   cancelAllMotionActivities();
 
   int32_t thr = clampI32(requestedThr, 0, 100);
 
-  targetDirection = (thr == 0) ? Direction::STOP : dir;
-  targetThrottle  = thr;
+  setTarget(dir, thr, "Instant command target");
 
   if (thr == 0) {
     stopMotorNow("Instant throttle=0");
     return;
   }
 
+  // Direction change while moving -> stop first (this schedules a NEW pending reverse)
   if (currentDirection != Direction::STOP && currentDirection != dir) {
     scheduleReverseAfterStop(dir, thr, /*instant*/true, /*momentum*/false);
     executeStopRamp(RampKind::QUICKSTOP);
@@ -592,32 +659,31 @@ static void executeInstant(Direction dir, int32_t requestedThr) {
   bool startingFromStop = (appliedThrottle == 0 && currentDirection == Direction::STOP);
   int32_t effThr = effectiveStartTargetThrottle(thr, startingFromStop);
 
-  targetDirection = (effThr == 0) ? Direction::STOP : dir;
-  targetThrottle  = effThr;
+  setTarget(dir, effThr, "Instant effective target");
 
   if (shouldKickOnStart(startingFromStop, effThr)) {
     beginKick(dir, effThr, /*afterKickIsInstant*/true, /*afterKickIsMomentum*/false);
     return;
   }
 
-  appliedThrottle = effThr;
-  currentDirection = dir;
+  setApplied(dir, effThr, "Instant apply");
   applyPwmOutputs(currentDirection, appliedThrottle);
 }
 
 static void executeMomentum(Direction dir, int32_t requestedThr) {
+  // New motion command overrides any previously queued reverse
+  cancelPendingReverse();
   cancelAllMotionActivities();
 
   int32_t thr = clampI32(requestedThr, 0, 100);
-
-  targetDirection = (thr == 0) ? Direction::STOP : dir;
-  targetThrottle  = thr;
+  setTarget(dir, thr, "Momentum command target");
 
   if (thr == 0) {
     executeStopRamp(RampKind::MOMENTUM);
     return;
   }
 
+  // Direction change while moving -> stop first (this schedules a NEW pending reverse)
   if (currentDirection != Direction::STOP && currentDirection != dir) {
     scheduleReverseAfterStop(dir, thr, /*instant*/false, /*momentum*/true);
     executeStopRamp(RampKind::MOMENTUM);
@@ -627,10 +693,12 @@ static void executeMomentum(Direction dir, int32_t requestedThr) {
   bool startingFromStop = (appliedThrottle == 0 && currentDirection == Direction::STOP);
   int32_t effTarget = effectiveStartTargetThrottle(thr, startingFromStop);
 
-  targetDirection = (effTarget == 0) ? Direction::STOP : dir;
-  targetThrottle  = effTarget;
+  setTarget(dir, effTarget, "Momentum effective target");
 
-  if (startingFromStop) currentDirection = dir;
+  if (startingFromStop) {
+    // Optional: direction bookkeeping
+    currentDirection = dir;
+  }
 
   if (shouldKickOnStart(startingFromStop, effTarget)) {
     beginKick(dir, effTarget, /*afterKickIsInstant*/false, /*afterKickIsMomentum*/true);
@@ -681,7 +749,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // When disconnected, LEDService will blink automatically
     graceActive = true;
     disconnectMs = millis();
-    debugPrintln("[BLE] Disconnected, grace started (10s)");
+
+    // NEW: reset countdown log timer so we print immediately
+    // (stored in processBleGrace as a static)
+    // We'll trigger first print by setting a "past" time:
+    // (done inside processBleGrace with static state)
+
+    if (debugMode) {
+      Serial.print("[BLE] Disconnected, grace started (");
+      Serial.print(BLE_GRACE_MS);
+      Serial.println("ms)");
+    }
 
     NimBLEDevice::startAdvertising();
   }
@@ -770,6 +848,11 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     if (upper == "D1") {
       debugMode = true;
       Serial.begin(115200);
+
+      // Reset logging baseline so first change prints
+      lastLoggedAppliedThrottle = -9999;
+      lastLoggedDirection = (Direction)255;
+
       Serial.println("[DEBUG] ON");
       Serial.print("[FW] ");
       Serial.print(FW_NAME);
@@ -781,6 +864,10 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
         Serial.print("[BLE] MTU=");
         Serial.println(g_peerMtu);
       }
+
+      // Force initial state print
+      logThrottleChangeIfNeeded("Debug enabled (baseline)");
+
       sendACK(preserved);
       return;
     }
@@ -933,6 +1020,23 @@ void setup() {
   setupDriverPins();
   setupPwm();
   stopMotorNow("Boot");
+
+  // ---------- Debug startup handling ----------
+  if (debugMode) {
+    Serial.begin(115200);
+
+    // Reset logging baseline so first change prints
+    lastLoggedAppliedThrottle = -9999;
+    lastLoggedDirection = (Direction)255;
+
+    Serial.println("[DEBUG] ON (startup)");
+    Serial.print("[FW] ");
+    Serial.print(FW_NAME);
+    Serial.print(" v");
+    Serial.println(FW_VERSION);
+    Serial.println("[BOOT] ready");
+  }
+
   setupBle();
 }
 
@@ -943,36 +1047,34 @@ static void processRamp() {
   uint32_t now = millis();
   uint32_t elapsed = now - rampStartMs;
 
-  appliedThrottle = smoothstepEasedThrottle(rampStartThrottle, rampTargetThrottle, elapsed, rampDurationMs);
+  int32_t newThr = smoothstepEasedThrottle(
+      rampStartThrottle,
+      rampTargetThrottle,
+      elapsed,
+      rampDurationMs);
 
-  if (rampTargetThrottle == 0 && appliedThrottle == 0) {
-    currentDirection = Direction::STOP;
+  if (rampTargetThrottle == 0 && newThr == 0) {
+    setApplied(Direction::STOP, 0, "Ramp tick -> stop");
     applyPwmOutputs(Direction::STOP, 0);
   } else {
-    currentDirection = rampDirection;
+    setApplied(rampDirection, newThr, "Ramp tick");
     applyPwmOutputs(currentDirection, appliedThrottle);
   }
 
   if (elapsed >= rampDurationMs) {
     rampActive = false;
 
-    appliedThrottle = rampTargetThrottle;
-    if (appliedThrottle == 0) {
-      currentDirection = Direction::STOP;
+    if (rampTargetThrottle == 0) {
+      setApplied(Direction::STOP, 0, "Ramp complete -> stop");
       applyPwmOutputs(Direction::STOP, 0);
     } else {
-      currentDirection = rampDirection;
+      setApplied(rampDirection, rampTargetThrottle, "Ramp complete");
       applyPwmOutputs(currentDirection, appliedThrottle);
     }
 
-    if (reversePending) {
-      if (appliedThrottle == 0) {
-        pendingStage = PendingStage::WAIT_DIR_DELAY;
-        pendingStageUntilMs = millis() + DIR_CHANGE_DELAY_MS;
-      } else {
-        reversePending = false;
-        pendingStage = PendingStage::NONE;
-      }
+    if (reversePending && appliedThrottle == 0) {
+      pendingStage = PendingStage::WAIT_DIR_DELAY;
+      pendingStageUntilMs = millis() + DIR_CHANGE_DELAY_MS;
     }
   }
 }
@@ -992,8 +1094,7 @@ static void processPendingReverse() {
   bool startingFromStop = (appliedThrottle == 0 && currentDirection == Direction::STOP);
   int32_t effThr = effectiveStartTargetThrottle(thr, startingFromStop);
 
-  targetDirection = (effThr == 0) ? Direction::STOP : dir;
-  targetThrottle  = effThr;
+  setTarget(dir, effThr, "Reverse complete target");
 
   if (shouldKickOnStart(startingFromStop, effThr)) {
     beginKick(dir, effThr, pendingFinalIsInstant, pendingFinalIsMomentum);
@@ -1002,21 +1103,22 @@ static void processPendingReverse() {
 
   reversePending = false;
 
+  // ----- Instant after reverse -----
   if (pendingFinalIsInstant) {
-    appliedThrottle = effThr;
-    currentDirection = (effThr == 0) ? Direction::STOP : dir;
+    setApplied(dir, effThr, "Reverse complete -> instant");
     applyPwmOutputs(currentDirection, appliedThrottle);
     return;
   }
 
+  // ----- Momentum after reverse -----
   if (pendingFinalIsMomentum) {
     uint32_t dur = scaledDurationMs(FULL_MOMENTUM_ACCEL_MS, abs(effThr));
     startRamp(dir, 0, effThr, dur, RampKind::MOMENTUM);
     return;
   }
 
-  appliedThrottle = effThr;
-  currentDirection = (effThr == 0) ? Direction::STOP : dir;
+  // ----- Fallback direct apply -----
+  setApplied(dir, effThr, "Reverse complete -> apply");
   applyPwmOutputs(currentDirection, appliedThrottle);
 }
 
@@ -1025,8 +1127,7 @@ static void processKick() {
 
   uint32_t now = millis();
   if ((int32_t)(now - kickEndMs) < 0) {
-    appliedThrottle = kickHoldThrottle;
-    currentDirection = kickDirection;
+    setApplied(kickDirection, kickHoldThrottle, "KICK hold");
     applyPwmOutputs(currentDirection, appliedThrottle);
     return;
   }
@@ -1039,12 +1140,54 @@ static void processBleGrace() {
   if (!graceActive) return;
 
   uint32_t now = millis();
+
+  // --- Debug countdown logging (once per second, plus immediate on entry) ---
+  static uint32_t lastCountdownLogMs = 0;
+  static bool countdownPrimed = false;
+
+  if (debugMode) {
+    if (!countdownPrimed) {
+      // first time we enter grace window
+      countdownPrimed = true;
+      lastCountdownLogMs = 0; // force immediate log
+    }
+
+    if (lastCountdownLogMs == 0 || (now - lastCountdownLogMs) >= GRACE_COUNTDOWN_LOG_PERIOD_MS) {
+      lastCountdownLogMs = now;
+
+      uint32_t elapsed = now - disconnectMs;
+      uint32_t remaining = (elapsed >= BLE_GRACE_MS) ? 0 : (BLE_GRACE_MS - elapsed);
+
+      Serial.print("[BLE] Grace countdown: ");
+      Serial.print(remaining);
+      Serial.println("ms remaining");
+    }
+  } else {
+    // If debug is off, don't keep stale primed state
+    countdownPrimed = false;
+    lastCountdownLogMs = 0;
+  }
+
+  // --- Timeout behavior ---
   if ((now - disconnectMs) >= BLE_GRACE_MS) {
     graceActive = false;
+
+    // reset countdown state for next disconnect
+    countdownPrimed = false;
+    lastCountdownLogMs = 0;
+
     forcedStopLatched = true;
 
-    stopMotorNow("BLE grace timeout -> forced stop latched");
-    debugPrintln("[BLE] Grace timeout: stopped + latched");
+    // Choose ONE behavior (pick the one you're currently using):
+    // A) original immediate stop:
+    // stopMotorNow("BLE grace timeout -> forced stop latched");
+
+    // B) "act like S was sent" behavior:
+    executeStopRamp(RampKind::QUICKSTOP);
+
+    if (debugMode) {
+      Serial.println("[BLE] Grace expired: forced stop latched");
+    }
   }
 }
 
