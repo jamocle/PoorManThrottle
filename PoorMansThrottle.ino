@@ -60,6 +60,11 @@
                     STOPPED
                     FORWARD <appliedThrottle>
                     REVERSE <appliedThrottle>
+  - ??          : Hardware State query (returns raw state text via notify; NO ACK/ERR wrapper)
+                Returns one of:
+                    STOPPED
+                    FORWARD <appliedThrottle>
+                    REVERSE <appliedThrottle>
   - G           : last 3 digits of the GUID
   - V           : Version query (responds as ACK:<FW_VERSION>)
                 Example: V  ->  ACK:1.0.6
@@ -92,17 +97,32 @@ enum class Direction : uint8_t { STOP = 0, FWD = 1, REV = 2 };
 enum class RampKind  : uint8_t { NONE = 0, MOMENTUM, BRAKE, QUICKSTOP };
 enum class PendingStage : uint8_t { NONE = 0, WAIT_DIR_DELAY };
 
+// ------------------------- Hardware readback (debug-only) -------------------------
+struct HwSnapshot {
+  bool ren;
+  bool len;
+  bool enabled;
+
+  uint32_t dutyR;
+  uint32_t dutyL;
+
+  Direction hwDir;
+  int32_t hwThrottlePct;   // 0..100 derived from duty/max
+};
+
 // ------------------------- Pins & PWM -------------------------
 static const int PIN_RPWM = 25;   // Forward PWM -> RPWM
 static const int PIN_LPWM = 26;   // Reverse PWM -> LPWM
 static const int PIN_REN = 27;  // IBT-2 R_EN
 static const int PIN_LEN = 33;  // IBT-2 L_EN
-
 static const uint32_t PWM_FREQ_HZ  = 20000;   // ~20kHz
 static const uint8_t  PWM_RES_BITS = 10;      // 8–10 bits allowed
 static const uint8_t  PWM_CH_R     = 0;
 static const uint8_t  PWM_CH_L     = 1;
 static const uint32_t PWM_MAX_DUTY = (1UL << PWM_RES_BITS) - 1;
+
+// ------------------------- PWM State ---------------------------
+static bool pwmInitialized = false;
 
 // ------------------------- Fixed-point easing -------------------------
 static const int32_t P_SCALE = 1000; // mandatory
@@ -115,6 +135,9 @@ static const uint32_t FULL_QUICKSTOP_MS      = 3000;
 static const uint32_t DIR_CHANGE_DELAY_MS    = 2000;
 static const uint32_t BLE_GRACE_MS           = 15000;
 static const uint32_t GRACE_COUNTDOWN_LOG_PERIOD_MS = 1000; // log once per second in debug
+static const uint32_t DEBUG_HW_SNAPSHOT_PERIOD_MS = 250;
+static const bool DEBUG_PRINT_PERIODIC_ONLY_ON_MISMATCH = true;
+static const bool DEBUG_PRINT_STORED_ONLY_ON_MISMATCH = false;
 
 // ------------------------- Motion/BLE state -------------------------
 static volatile bool debugMode = DEBUG_AT_STARTUP;
@@ -301,6 +324,7 @@ static void debugPrintln(const String& s) {
 // ------------------------- Throttle change logging -------------------------
 static int32_t lastLoggedAppliedThrottle = -9999;
 static Direction lastLoggedDirection = Direction::STOP;
+static const char* g_lastDbgReason = "BOOT";
 
 static const char* dirStr(Direction d) {
   switch (d) {
@@ -311,33 +335,180 @@ static const char* dirStr(Direction d) {
   }
 }
 
+// ------------------------- Hardware readback (debug-only) -------------------------
+static inline uint32_t readLedcDuty(uint8_t pwmChannel) {
+  // Read back the PWM duty using the Arduino-ESP32 API (ledcRead).
+  // This reflects the *configured LEDC duty register* (0..PWM_MAX_DUTY),
+  // not motor physics (voltage/current/speed).
+  // Note: If PWM isn’t initialized yet, return 0 to avoid junk reads.
+  if (!pwmInitialized) return 0;
+  return (uint32_t)ledcRead(pwmChannel);
+}
+
+static HwSnapshot getHwSnapshot() {
+  HwSnapshot s{};
+
+  // EN pins as seen by GPIO input buffers
+  s.ren = (digitalRead(PIN_REN) == HIGH);
+  s.len = (digitalRead(PIN_LEN) == HIGH);
+  s.enabled = (s.ren && s.len);
+
+  // PWM duties as currently configured in LEDC hardware
+  s.dutyR = readLedcDuty(PWM_CH_R);
+  s.dutyL = readLedcDuty(PWM_CH_L);
+
+  // Derive hardware direction + throttle %
+  if (!s.enabled || (s.dutyR == 0 && s.dutyL == 0)) {
+    s.hwDir = Direction::STOP;
+    s.hwThrottlePct = 0;
+  } else if (s.dutyR > 0 && s.dutyL == 0) {
+    s.hwDir = Direction::FWD;
+    s.hwThrottlePct = (int32_t)(((uint64_t)s.dutyR * 100ULL + (PWM_MAX_DUTY / 2)) / (uint64_t)PWM_MAX_DUTY);
+  } else if (s.dutyL > 0 && s.dutyR == 0) {
+    s.hwDir = Direction::REV;
+    s.hwThrottlePct = (int32_t)(((uint64_t)s.dutyL * 100ULL + (PWM_MAX_DUTY / 2)) / (uint64_t)PWM_MAX_DUTY);
+  } else {
+    // Should never happen in the logic (both sides driven), but useful as a fault indicator
+    s.hwDir = Direction::STOP;
+    s.hwThrottlePct = 0;
+  }
+
+  s.hwThrottlePct = clampI32(s.hwThrottlePct, 0, 100);
+  return s;
+}
+
+static bool hwMatchesStored(const HwSnapshot& hw) {
+  // Treat stored STOP / appliedThrottle==0 as STOP expectation
+  Direction storedDir = (appliedThrottle <= 0 || currentDirection == Direction::STOP)
+                          ? Direction::STOP
+                          : currentDirection;
+
+  int32_t storedPct = clampI32(appliedThrottle, 0, 100);
+
+  // Direction must match, and throttle should be close (PWM quantization can cause +/-1%)
+  if (hw.hwDir != storedDir) return false;
+
+  int32_t diff = abs(hw.hwThrottlePct - storedPct);
+  return (diff <= 2);
+}
+
 static void logThrottleChangeIfNeeded(const char* reason) {
   if (!debugMode) return;
 
-  if (appliedThrottle != lastLoggedAppliedThrottle ||
-      currentDirection != lastLoggedDirection) {
+  // Periodic snapshot (C)
+  static uint32_t lastPeriodicMs = 0;
+  uint32_t now = millis();
+  bool periodicDue = (lastPeriodicMs == 0) || ((now - lastPeriodicMs) >= DEBUG_HW_SNAPSHOT_PERIOD_MS);
 
-    Serial.print("[THR] ");
-    Serial.print(reason);
-    Serial.print(" | dir=");
-    Serial.print(dirStr(currentDirection));
-    Serial.print(" applied=");
-    Serial.print(appliedThrottle);
-    Serial.print(" targetDir=");
-    Serial.print(dirStr(targetDirection));
-    Serial.print(" target=");
-    Serial.print(targetThrottle);
-    Serial.print(" ramp=");
-    Serial.print(rampActive ? "1" : "0");
-    Serial.print(" kick=");
-    Serial.print(kickActive ? "1" : "0");
-    Serial.print(" pending=");
-    Serial.print(reversePending ? "1" : "0");
-    Serial.print(" ble=");
-    Serial.print(bleConnected ? "1" : "0");
-    Serial.print(" latch=");
-    Serial.println(forcedStopLatched ? "1" : "0");
+  bool storedChanged =
+      (appliedThrottle != lastLoggedAppliedThrottle) ||
+      (currentDirection != lastLoggedDirection);
 
+  // If neither stored change nor periodic due, do nothing.
+  if (!storedChanged && !periodicDue) return;
+
+  // Take periodic timestamp *now* so we don't hammer if we decide not to print.
+  // (We still "sample" at the requested interval; printing is conditional.)
+  if (periodicDue) lastPeriodicMs = now;
+
+  // Read hardware snapshot (A)
+  HwSnapshot hw = getHwSnapshot();
+  bool match = hwMatchesStored(hw);
+
+  // Decide whether to print:
+  // - Always print on stored change
+  // - For periodic: print only when mismatch (if toggle enabled), else print every period
+  bool shouldPrint = false;
+
+  if (storedChanged) {
+    if (DEBUG_PRINT_STORED_ONLY_ON_MISMATCH) {
+      shouldPrint = !match;
+    } else {
+      shouldPrint = true;
+    }
+  } else if (periodicDue) {
+    if (DEBUG_PRINT_PERIODIC_ONLY_ON_MISMATCH) {
+      shouldPrint = !match;
+    } else {
+      shouldPrint = true;
+    }
+  }
+
+  if (!shouldPrint) {
+  // Even if we suppress printing, we must advance the baseline
+  // or "storedChanged" will remain true forever.
+  if (storedChanged) {
+    lastLoggedAppliedThrottle = appliedThrottle;
+    lastLoggedDirection = currentDirection;
+  }
+    return;
+  }
+
+
+  Serial.print("[THR] ");
+  Serial.print(reason);
+
+  if (!storedChanged && periodicDue) {
+    Serial.print(" (periodic)");
+  }
+
+  // --- STORED ---
+  Serial.print(" | STORED dir=");
+  Serial.print(dirStr(currentDirection));
+  Serial.print(" applied=");
+  Serial.print(appliedThrottle);
+  Serial.print(" targetDir=");
+  Serial.print(dirStr(targetDirection));
+  Serial.print(" target=");
+  Serial.print(targetThrottle);
+  Serial.print(" ramp=");
+  Serial.print(rampActive ? "1" : "0");
+  Serial.print(" kick=");
+  Serial.print(kickActive ? "1" : "0");
+  Serial.print(" pending=");
+  Serial.print(reversePending ? "1" : "0");
+  Serial.print(" ble=");
+  Serial.print(bleConnected ? "1" : "0");
+  Serial.print(" latch=");
+  Serial.print(forcedStopLatched ? "1" : "0");
+
+  // --- HW ---
+  Serial.print(" | HW EN=");
+  Serial.print(hw.enabled ? "1" : "0");
+  Serial.print(" (REN=");
+  Serial.print(hw.ren ? "1" : "0");
+  Serial.print(" LEN=");
+  Serial.print(hw.len ? "1" : "0");
+  Serial.print(")");
+  Serial.print(" dutyR=");
+  Serial.print(hw.dutyR);
+  Serial.print(" dutyL=");
+  Serial.print(hw.dutyL);
+  Serial.print(" hwDir=");
+  Serial.print(dirStr(hw.hwDir));
+  Serial.print(" hw%=");
+  Serial.print(hw.hwThrottlePct);
+
+  // --- Mismatch indicator + quick diff ---
+  Serial.print(" | ");
+  if (match) {
+    Serial.println("OK");
+  } else {
+    // Use the SAME expectation logic as hwMatchesStored()
+    Direction storedDir = (appliedThrottle <= 0 || currentDirection == Direction::STOP)
+                            ? Direction::STOP
+                            : currentDirection;
+    int32_t storedPct = clampI32(appliedThrottle, 0, 100);
+
+    Serial.print("MISMATCH");
+    Serial.print(" dDir=");
+    Serial.print((int)hw.hwDir - (int)storedDir);
+    Serial.print(" d%=");
+    Serial.println(hw.hwThrottlePct - storedPct);
+  }
+
+  // Update baseline only when stored state changed
+  if (storedChanged) {
     lastLoggedAppliedThrottle = appliedThrottle;
     lastLoggedDirection = currentDirection;
   }
@@ -347,7 +518,11 @@ static inline void setApplied(Direction dir, int32_t thr, const char* reason) {
   thr = clampI32(thr, 0, 100);
   currentDirection = (thr == 0) ? Direction::STOP : dir;
   appliedThrottle  = thr;
-  logThrottleChangeIfNeeded(reason);
+
+  // Debug-only: remember why the last state changed.
+  g_lastDbgReason = reason;
+
+  // DO NOT log here anymore (hardware may not be updated yet).
 }
 
 static inline void setTarget(Direction dir, int32_t thr, const char* reason) {
@@ -431,6 +606,21 @@ static String getStateString() {
   return "STOPPED";
 }
 
+static String getHwStateString() {
+  HwSnapshot hw = getHwSnapshot();
+
+  if (hw.hwThrottlePct <= 0 || hw.hwDir == Direction::STOP) {
+    return "STOPPED";
+  }
+  if (hw.hwDir == Direction::FWD) {
+    return "FORWARD " + String(hw.hwThrottlePct);
+  }
+  if (hw.hwDir == Direction::REV) {
+    return "REVERSE " + String(hw.hwThrottlePct);
+  }
+  return "STOPPED";
+}
+
 // ------------------------- MTU-aware BLE notify (chunked) -------------------------
 static size_t getNotifyPayloadLimit() {
   const size_t fallback = 20;
@@ -508,8 +698,7 @@ static void startRamp(Direction dirDuringRamp, int32_t startThr, int32_t endThr,
   targetThrottle  = endThr;
 
   if (durationMs == 0 || startThr == endThr) {
-    appliedThrottle = endThr;
-    currentDirection = (endThr == 0) ? Direction::STOP : dirDuringRamp;
+    setApplied(dirDuringRamp, endThr, "Ramp immediate");
     applyPwmOutputs(currentDirection, appliedThrottle);
     return;
   }
@@ -571,8 +760,7 @@ static void continueAfterKickIfNeeded() {
   reversePending = false;
 
   if (isInstant) {
-    appliedThrottle = thr;
-    currentDirection = (thr == 0) ? Direction::STOP : dir;
+    setApplied(dir, thr, "KICK -> instant");
     applyPwmOutputs(currentDirection, appliedThrottle);
     return;
   }
@@ -585,8 +773,7 @@ static void continueAfterKickIfNeeded() {
     return;
   }
 
-  appliedThrottle = thr;
-  currentDirection = (thr == 0) ? Direction::STOP : dir;
+  setApplied(dir, thr, "KICK -> apply");
   applyPwmOutputs(currentDirection, appliedThrottle);
 }
 
@@ -771,11 +958,15 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     bool allowMotionNow = !(forcedStopLatched && !bleConnected);
 
     // STATE (no ACK, raw response only)
+    if (upper == "??") {
+      bleNotifyChunked(getHwStateString());
+      return;
+    }
     if (upper == "?") {
       bleNotifyChunked(getStateString());
       return;
     }
-
+  
     // VERSION
     if (upper == "V") {
       sendACK(String(FW_VERSION));
@@ -927,7 +1118,15 @@ static void setupPwm() {
   ledcSetup(PWM_CH_L, PWM_FREQ_HZ, PWM_RES_BITS);
   ledcAttachPin(PIN_RPWM, PWM_CH_R);
   ledcAttachPin(PIN_LPWM, PWM_CH_L);
+  pwmInitialized = true; 
   applyPwmOutputs(Direction::STOP, 0);
+
+  if (debugMode) {
+    Serial.print("[PWM] init ok, dutyR=");
+    Serial.print(ledcRead(PWM_CH_R));
+    Serial.print(" dutyL=");
+    Serial.println(ledcRead(PWM_CH_L));
+  }
 }
 
 static void setupDriverPins() {
@@ -964,16 +1163,17 @@ static void setupBle() {
 }
 
 void setup() {
+  if (debugMode) {
+    Serial.begin(115200);
+    delay(50);
+  }
+
   ledInit();      // LED starts in "disconnected blink" mode by ledService()
   setupDriverPins();
   setupPwm();
   stopMotorNow("Boot");
 
-  // ---------- Debug startup handling ----------
   if (debugMode) {
-    Serial.begin(115200);
-
-    // Reset logging baseline so first change prints
     lastLoggedAppliedThrottle = -9999;
     lastLoggedDirection = (Direction)255;
 
@@ -1151,5 +1351,10 @@ void loop() {
   if (!rampActive && !kickActive) {
     if (appliedThrottle == 0) currentDirection = Direction::STOP;
     applyPwmOutputs(currentDirection, appliedThrottle);
+  }
+
+  // ---- DEBUG SNAPSHOT HOOK (non-control, debug only) ----
+  if (debugMode && pwmInitialized) {
+    logThrottleChangeIfNeeded(g_lastDbgReason);
   }
 }
