@@ -2,7 +2,7 @@
   (C) James Theimer 2026 Poor Man's Throttle
   ESP32 BLE Heavy-Train Throttle Controller (FINAL SPEC)
 
-  LED behavior (GPIO2) — per your request:
+  LED behavior (GPIO2):
   - Default / disconnected: LED blinks continuously
   - Connected: LED stays solid ON
   - Disconnected: LED returns to blinking
@@ -20,7 +20,6 @@
   - For most commands, ESP32 responds via TX Notify with:
       ACK:<original command>   (valid)
       ERR:<original command>   (invalid)
-    Help sends ACK first, then multiple MENU: lines.
   - Throttle values are clamped to 0..100.
   - Stop-first reversing is enforced (ramps to 0, wait 250ms, then reverse).
 
@@ -56,11 +55,6 @@
   - D<n>        : n=1 Debug ON (prints FW name/version, BLE MTU, events)
                 : n=0 Debug OFF
 
-  HELP (BLE Notify output)
-  - H  or H1    : HELP1 (compact). Sends ACK then multiple MENU: lines
-  - H2          : HELP2 (detailed). Sends ACK then multiple MENU: lines
-
-  EXTRA COMMANDS IN THIS BUILD (your additions)
   - ?           : State query (returns raw state text via notify; NO ACK/ERR wrapper)
                 Returns one of:
                     STOPPED
@@ -76,7 +70,7 @@
 #include <type_traits>
 
 // ------------------------- Startup defaults -------------------------
-static const bool DEBUG_AT_STARTUP = true;  
+static const bool DEBUG_AT_STARTUP = true;
 
 // ------------------------- Firmware ID -------------------------
 static const char* FW_NAME    = "GScaleThrottle";
@@ -171,14 +165,12 @@ static NimBLEServer* pServerGlobal = nullptr;
 static uint16_t g_peerMtu = 23;  // default
 
 // ------------------------- Status LED (GPIO2) -------------------------
-// Your requested behavior:
-// - Disconnected: blink continuously
+// - Disconnected: blink continuously (double-blink search pattern)
 // - Connected: solid ON
 // - RX/TX while connected: briefly OFF (dip), then back ON
 static const int LED_PIN = 2;
 
 // Blink timing while disconnected
-// Disconnected search pattern timing
 static const uint16_t LED_SEARCH_ON_1_MS   = 70;
 static const uint16_t LED_SEARCH_GAP_MS    = 90;
 static const uint16_t LED_SEARCH_ON_2_MS   = 70;
@@ -236,13 +228,12 @@ static inline void ledService() {
         ledWrite(true); // back to solid ON
       }
     } else {
-      // Ensure solid ON
       if (!ledIsOn) ledWrite(true);
     }
     return;
   }
 
-    // 2) If disconnected: double-blink search pattern
+  // 2) If disconnected: double-blink search pattern
   ledDipActive = false; // no dips in blink mode
 
   static uint8_t searchStep = 0;
@@ -385,11 +376,10 @@ static inline void driverEnable(bool en) {
 }
 
 static void applyPwmOutputs(Direction dir, int32_t thr) {
-  // Any zero-throttle condition should be a TRUE stop (coast/off)
   if (thr <= 0 || dir == Direction::STOP) {
     ledcWrite(PWM_CH_R, 0);
     ledcWrite(PWM_CH_L, 0);
-    driverEnable(false);   // EN LOW = true off/coast (matches our voltage tests)
+    driverEnable(false);   // EN LOW = true off/coast
     return;
   }
 
@@ -420,7 +410,7 @@ static void stopMotorNow(const char* reason) {
   pendingStage = PendingStage::NONE;
 
   applyPwmOutputs(Direction::STOP, 0);
-   driverEnable(false);  // TRUE STOP: coast/off
+  driverEnable(false);  // TRUE STOP: coast/off
 
   if (debugMode) {
     Serial.print("[STOP] ");
@@ -429,7 +419,6 @@ static void stopMotorNow(const char* reason) {
 }
 
 static String getStateString() {
-  // Momentary state: based on currentDirection + appliedThrottle (not target)
   if (appliedThrottle <= 0 || currentDirection == Direction::STOP) {
     return "STOPPED";
   }
@@ -469,7 +458,7 @@ static void bleNotifyChunked(const String& text) {
     String part = text.substring((unsigned int)i, (unsigned int)(i + take));
     pTxChar->setValue(part.c_str());
 
-    // ✅ Your new behavior: TX briefly turns LED OFF (dip) while connected/solid
+    // TX briefly turns LED OFF (dip) while connected/solid
     ledDipTx();
 
     pTxChar->notify();
@@ -479,7 +468,6 @@ static void bleNotifyChunked(const String& text) {
 
 static void sendACK(const String& original)  { bleNotifyChunked("ACK:" + original); }
 static void sendERR(const String& original)  { bleNotifyChunked("ERR:" + original); }
-static void sendMENU(const String& text)     { bleNotifyChunked("MENU:" + text); }
 
 // ------------------------- Ramp engine (fixed-point smoothstep) -------------------------
 static int32_t smoothstepEasedThrottle(int32_t startThr, int32_t targetThr, uint32_t elapsedMs, uint32_t durationMs) {
@@ -504,10 +492,7 @@ static int32_t smoothstepEasedThrottle(int32_t startThr, int32_t targetThr, uint
 static void cancelAllMotionActivities() {
   rampActive = false;
   kickActive = false;
-
-  // IMPORTANT:
-  // Do NOT clear reversePending / pendingStage here.
-  // Those are used to sequence stop-first reversing.
+  // Do NOT clear reversePending/pendingStage here (used for stop-first reversing).
 }
 
 static void startRamp(Direction dirDuringRamp, int32_t startThr, int32_t endThr, uint32_t durationMs, RampKind kind) {
@@ -607,8 +592,7 @@ static void continueAfterKickIfNeeded() {
 
 // ------------------------- Motion command execution -------------------------
 static void executeStopRamp(RampKind kind) {
-  // Only cancel ramp/kick. Preserve reversePending sequencing.
-  cancelAllMotionActivities();
+  cancelAllMotionActivities(); // preserve reverse sequencing
 
   int32_t startThr = appliedThrottle;
   int32_t deltaAbs = abs(startThr);
@@ -696,8 +680,7 @@ static void executeMomentum(Direction dir, int32_t requestedThr) {
   setTarget(dir, effTarget, "Momentum effective target");
 
   if (startingFromStop) {
-    // Optional: direction bookkeeping
-    currentDirection = dir;
+    currentDirection = dir; // bookkeeping
   }
 
   if (shouldKickOnStart(startingFromStop, effTarget)) {
@@ -750,11 +733,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     graceActive = true;
     disconnectMs = millis();
 
-    // NEW: reset countdown log timer so we print immediately
-    // (stored in processBleGrace as a static)
-    // We'll trigger first print by setting a "past" time:
-    // (done inside processBleGrace with static state)
-
     if (debugMode) {
       Serial.print("[BLE] Disconnected, grace started (");
       Serial.print(BLE_GRACE_MS);
@@ -772,7 +750,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     std::string val = pCharacteristic->getValue();
     if (val.empty()) return;
 
-    // ✅ Your new behavior: RX briefly turns LED OFF (dip) while connected/solid
+    // RX briefly turns LED OFF (dip) while connected/solid
     ledDipRx();
 
     String preserved = String(val.c_str());
@@ -792,50 +770,20 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 
     bool allowMotionNow = !(forcedStopLatched && !bleConnected);
 
-    // HELP
-    if (upper == "H" || upper == "H1") {
-      sendACK(preserved);
-      sendMENU("F<n> R<n>: momentum 0-100");
-      sendMENU("FQ<n> RQ<n>: instant 0-100");
-      sendMENU("S: quick stop  B: brake");
-      sendMENU("M<n>  K<t>,<ms>");
-      sendMENU("?: State");
-      sendMENU("V: Version");
-      sendMENU("G: Board Guid");
-      sendMENU("D1 debug on  D0 off  H2 more");
-      return;
-    }
-    if (upper == "H2") {
-      sendACK(preserved);
-      sendMENU("F<n>: ramp forward to n (smooth)");
-      sendMENU("R<n>: ramp reverse to n (smooth)");
-      sendMENU("Reverse: ramp to 0, wait 250ms");
-      sendMENU("FQ/RQ: quick-stop, wait, jump");
-      sendMENU("S: quick stop 1.5s full-scale");
-      sendMENU("B: brake 4.0s full-scale");
-      sendMENU("M: only when starting");
-      sendMENU("K: hold then ramp/jump");
-      sendMENU("?: State");
-      sendMENU("V: Version");
-      sendMENU("G: Board Guid");
-      sendMENU("D1/D0: Serial debug only");
-      return;
-    }
-
     // STATE (no ACK, raw response only)
     if (upper == "?") {
-        bleNotifyChunked(getStateString());
-        return;
+      bleNotifyChunked(getStateString());
+      return;
     }
 
     // VERSION
-    if(upper == "V") {
-        sendACK(String(FW_VERSION));
-        return;
+    if (upper == "V") {
+      sendACK(String(FW_VERSION));
+      return;
     }
 
-    //GUID
-    if(upper == "G") {
+    // GUID
+    if (upper == "G") {
       String uuid = String(SERVICE_UUID);
 
       // Extract last 17 characters: "9bd6-1e8cde2c9000"
@@ -1009,7 +957,7 @@ static void setupBle() {
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SERVICE_UUID);
-  adv->setName(FW_NAME);  // shows up as "GScaleThrottle"
+  adv->setName(FW_NAME);
   adv->start();
 
   debugPrintln("[BLE] Advertising");
@@ -1178,7 +1126,7 @@ static void processBleGrace() {
 
     forcedStopLatched = true;
 
-    // Choose ONE behavior (pick the one you're currently using):
+    // Options:
     // A) original immediate stop:
     // stopMotorNow("BLE grace timeout -> forced stop latched");
 
