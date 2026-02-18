@@ -75,7 +75,7 @@
 #include <type_traits>
 
 // ------------------------- Startup defaults -------------------------
-static const bool DEBUG_AT_STARTUP = true;
+static const bool DEBUG_AT_STARTUP = false;
 
 // ------------------------- Firmware ID -------------------------
 static const char* FW_NAME    = "GScaleThrottle";
@@ -130,14 +130,20 @@ static const int32_t P_SCALE = 1000; // mandatory
 // ------------------------- Timing constants -------------------------
 static const uint32_t FULL_MOMENTUM_ACCEL_MS = 20000; // full-scale 100 step
 static const uint32_t FULL_MOMENTUM_DECEL_MS = 20000;
+static const uint32_t FULL_QUICKRAMP_ACCEL_MS = 2500; // 0->100 in 4s (tune)
+static const uint32_t FULL_QUICKRAMP_DECEL_MS = 2500; 
 static const uint32_t FULL_BRAKE_MS          = 10000;
 static const uint32_t FULL_QUICKSTOP_MS      = 3000;
 static const uint32_t DIR_CHANGE_DELAY_MS    = 2000;
 static const uint32_t BLE_GRACE_MS           = 15000;
 static const uint32_t GRACE_COUNTDOWN_LOG_PERIOD_MS = 1000; // log once per second in debug
-static const uint32_t DEBUG_HW_SNAPSHOT_PERIOD_MS = 250;
+static const uint32_t DEBUG_HW_SNAPSHOT_PERIOD_MS = 2000;
 static const bool DEBUG_PRINT_PERIODIC_ONLY_ON_MISMATCH = true;
 static const bool DEBUG_PRINT_STORED_ONLY_ON_MISMATCH = false;
+
+// Pending reverse needs to remember which ramp constants to use after the delay
+static uint32_t pendingFullAccelMs = FULL_MOMENTUM_ACCEL_MS;
+static uint32_t pendingFullDecelMs = FULL_MOMENTUM_DECEL_MS;
 
 // ------------------------- Motion/BLE state -------------------------
 static volatile bool debugMode = DEBUG_AT_STARTUP;
@@ -183,6 +189,8 @@ static bool forcedStopLatched = false;
 
 static NimBLECharacteristic* pTxChar = nullptr;
 static NimBLEServer* pServerGlobal = nullptr;
+
+static bool printPeriodic = DEBUG_PRINT_PERIODIC_ONLY_ON_MISMATCH;
 
 // MTU-aware chunking state
 static uint16_t g_peerMtu = 23;  // default
@@ -427,7 +435,7 @@ static void logThrottleChangeIfNeeded(const char* reason) {
       shouldPrint = true;
     }
   } else if (periodicDue) {
-    if (DEBUG_PRINT_PERIODIC_ONLY_ON_MISMATCH) {
+    if (printPeriodic) {
       shouldPrint = !match;
     } else {
       shouldPrint = true;
@@ -525,7 +533,7 @@ static inline void setApplied(Direction dir, int32_t thr, const char* reason) {
   // DO NOT log here anymore (hardware may not be updated yet).
 }
 
-static inline void setTarget(Direction dir, int32_t thr, const char* reason) {
+static inline void setTarget(Direction dir, int32_t thr, const String& reason) {
   thr = clampI32(thr, 0, 100);
   targetDirection = (thr == 0) ? Direction::STOP : dir;
   targetThrottle  = thr;
@@ -841,36 +849,54 @@ static void executeInstant(Direction dir, int32_t requestedThr) {
   applyPwmOutputs(currentDirection, appliedThrottle);
 }
 
-static void executeMomentum(Direction dir, int32_t requestedThr) {
+static void executeRampedMove(Direction dir,
+                              int32_t requestedThr,
+                              uint32_t fullScaleAccelMs,
+                              uint32_t fullScaleDecelMs,
+                              RampKind stopFirstRampKind,
+                              const char* tagReason) {
   // New motion command overrides any previously queued reverse
   cancelPendingReverse();
   cancelAllMotionActivities();
 
   int32_t thr = clampI32(requestedThr, 0, 100);
-  setTarget(dir, thr, "Momentum command target");
+  setTarget(dir, thr, String(tagReason) + " target");
 
+  // If target is 0, ramp down using the chosen stop flavor
   if (thr == 0) {
-    executeStopRamp(RampKind::MOMENTUM);
+    executeStopRamp(stopFirstRampKind);
     return;
   }
 
-  // Direction change while moving -> stop first (this schedules a NEW pending reverse)
+  // Direction change while moving -> stop first, then wait, then ramp up
   if (currentDirection != Direction::STOP && currentDirection != dir) {
-    scheduleReverseAfterStop(dir, thr, /*instant*/false, /*momentum*/true);
-    executeStopRamp(RampKind::MOMENTUM);
+    // Store what to do after stop + delay:
+    scheduleReverseAfterStop(dir, thr, /*isInstant*/false, /*isMomentum*/true);
+
+    // Store WHICH ramp constants to use after the delay
+    pendingFullAccelMs = fullScaleAccelMs;
+    pendingFullDecelMs = fullScaleDecelMs;
+
+    // Ramp to zero first
+    executeStopRamp(stopFirstRampKind);
     return;
   }
 
   bool startingFromStop = (appliedThrottle == 0 && currentDirection == Direction::STOP);
   int32_t effTarget = effectiveStartTargetThrottle(thr, startingFromStop);
 
-  setTarget(dir, effTarget, "Momentum effective target");
+  setTarget(dir, effTarget, String(tagReason) + " effective target");
 
   if (startingFromStop) {
     currentDirection = dir; // bookkeeping
   }
 
   if (shouldKickOnStart(startingFromStop, effTarget)) {
+    // After kick: ramped (not instant). We'll treat the continuation as "momentum-like"
+    // but we must also preserve quick vs momentum ramp constants.
+    pendingFullAccelMs = fullScaleAccelMs;
+    pendingFullDecelMs = fullScaleDecelMs;
+
     beginKick(dir, effTarget, /*afterKickIsInstant*/false, /*afterKickIsMomentum*/true);
     return;
   }
@@ -882,9 +908,28 @@ static void executeMomentum(Direction dir, int32_t requestedThr) {
     return;
   }
 
-  uint32_t full = (effTarget > startThr) ? FULL_MOMENTUM_ACCEL_MS : FULL_MOMENTUM_DECEL_MS;
-  uint32_t dur = scaledDurationMs(full, deltaAbs);
+  uint32_t full = (effTarget > startThr) ? fullScaleAccelMs : fullScaleDecelMs;
+  uint32_t dur  = scaledDurationMs(full, deltaAbs);
+
   startRamp(dir, startThr, effTarget, dur, RampKind::MOMENTUM);
+}
+
+static void executeMomentum(Direction dir, int32_t requestedThr) {
+  executeRampedMove(dir,
+                    requestedThr,
+                    FULL_MOMENTUM_ACCEL_MS,
+                    FULL_MOMENTUM_DECEL_MS,
+                    RampKind::MOMENTUM,   // stop-first uses momentum decel feel
+                    "Momentum");
+}
+
+static void executeQuickRamp(Direction dir, int32_t requestedThr) {
+  executeRampedMove(dir,
+                    requestedThr,
+                    FULL_QUICKRAMP_ACCEL_MS,
+                    FULL_QUICKRAMP_DECEL_MS,
+                    RampKind::QUICKSTOP,  // stop-first: quick down feels snappier for Q
+                    "QuickRamp");
 }
 
 // ------------------------- BLE callbacks -------------------------
@@ -1016,6 +1061,31 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
+    // PERIODIC PRINT CONTROL
+    // P1 = periodic prints ONLY when mismatch (default behavior)
+    // P0 = periodic prints every period (even if OK)
+    if (upper == "P0") {
+      printPeriodic = true;
+
+      if (debugMode) {
+        Serial.println("[CFG] Periodic prints: ONLY ON MISMATCH");
+      }
+
+      sendACK(preserved);
+      return;
+    }
+
+    if (upper == "P1") {
+      printPeriodic = false;
+
+      if (debugMode) {
+        Serial.println("[CFG] Periodic prints: ALWAYS (every period)");
+      }
+
+      sendACK(preserved);
+      return;
+    }
+
     // MINSTART
     if (upper.startsWith("M")) {
       String nStr = original.substring(String("M").length());
@@ -1068,7 +1138,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
-    // INSTANT: FQ / RQ
+    // QUICK RAMP: FQ / RQ
     if (upper.startsWith("FQ") || upper.startsWith("RQ")) {
       String nStr = original.substring(2);
       nStr.trim();
@@ -1078,7 +1148,8 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 
       if (allowMotionNow) {
         if (forcedStopLatched && bleConnected) forcedStopLatched = false;
-        executeInstant(upper.startsWith("FQ") ? Direction::FWD : Direction::REV, n);
+        //executeInstant(upper.startsWith("FQ") ? Direction::FWD : Direction::REV, n);
+        executeQuickRamp(upper.startsWith("FQ") ? Direction::FWD : Direction::REV, n);
       } else {
         stopMotorNow("Forced-stop latched; motion ignored until reconnect");
       }
@@ -1260,7 +1331,8 @@ static void processPendingReverse() {
 
   // ----- Momentum after reverse -----
   if (pendingFinalIsMomentum) {
-    uint32_t dur = scaledDurationMs(FULL_MOMENTUM_ACCEL_MS, abs(effThr));
+    // Use the ramp constants that were active when the command was issued (momentum vs quick ramp)
+    uint32_t dur = scaledDurationMs(pendingFullAccelMs, abs(effThr));
     startRamp(dir, 0, effThr, dur, RampKind::MOMENTUM);
     return;
   }
