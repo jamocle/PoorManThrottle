@@ -1,11 +1,10 @@
 /*
   (C) James Theimer 2026 Poor Man's Throttle
-  ESP32 BLE Heavy-Train Throttle Controller (FINAL SPEC)
+  ESP32 BLE Heavy-Train Throttle Controller
 
   LED behavior (GPIO2):
-  - Default / disconnected: LED blinks continuously
+  - Default / disconnected: LED blinks continuously (double-blink search pattern)
   - Connected: LED stays solid ON
-  - Disconnected: LED returns to blinking
   - RX/TX while connected (solid ON): LED briefly turns OFF (a quick dip), then returns solid ON
 
   Target: ESP32-WROOM-32 (Arduino framework)
@@ -17,69 +16,104 @@
   Notes:
   - Commands are case-insensitive.
   - Whitespace + CR/LF are trimmed.
-  - For most commands, ESP32 responds via TX Notify with:
+  - Throttle values are clamped to 0..100.
+  - Stop-first reversing is enforced (ramps to 0, waits direction-delay, then reverses).
+  - After BLE disconnect, a grace timer runs. If not reconnected,
+    a forced stop is latched and a stop ramp is executed.
+
+  Response behavior:
+  - Most commands respond with:
       ACK:<original command>   (valid)
       ERR:<original command>   (invalid)
-  - Throttle values are clamped to 0..100.
-  - Stop-first reversing is enforced (ramps to 0, wait 250ms, then reverse).
+  - The following commands return RAW text (no ACK/ERR wrapper):
+      ?, ??, G
 
-  MOTION (Momentum / Nonlinear Ramp)
-  - F<n>        : Forward to throttle n (0..100) using momentum ramp (smoothstep)
-                Accel full-scale=10s, Decel full-scale=6s
-                Example: F40
+  --------------------------------------------------------------------------
+
+  MOTION (Momentum / Nonlinear Ramp - smoothstep easing)
+  - F<n>        : Forward to throttle n (0..100) using momentum ramp
   - R<n>        : Reverse to throttle n (0..100) using momentum ramp
-                Example: R25
 
-  MOTION (Instant)
-  - FQ<n>       : Forward immediate to throttle n (0..100)
-                If reversing, performs quick-stop ramp -> 250ms -> jump
-                Example: FQ60
-  - RQ<n>       : Reverse immediate to throttle n (0..100)
-                Example: RQ60
+  --------------------------------------------------------------------------
+
+  MOTION (Quick Ramp - smoothstep, faster profile)
+  - FQ<n>       : Forward to throttle n (0..100) using quick ramp
+                  If reversing, performs stop ramp → direction delay → quick ramp up
+  - RQ<n>       : Reverse to throttle n (0..100) using quick ramp
+
+  --------------------------------------------------------------------------
 
   STOPS
-  - S           : Quick stop ramp to 0 (full-scale 1.5s)
-  - B           : Brake ramp to 0 (full-scale 4.0s)
+  - S           : Quick stop ramp to 0
+  - B           : Brake ramp to 0 (slower deceleration profile)
+
+  --------------------------------------------------------------------------
 
   START ASSIST CONFIG
-  - M<n>        : MINSTART-Set minimum starting throttle (0..100)
-                Applied ONLY when starting from stop; does NOT block decel below it
-                Example: M15
-  - K<t>,<ms>   : KICK-Set start kick throttle and duration
-                t = 0..100, ms = 0..2000
-                When starting from stop with target > 0, apply max(t, MINSTART) for ms,
-                then continue ramp/instant behavior
-                Example: K60,200
 
-  DEBUG (Serial only)
-  - D<n>        : n=1 Debug ON (prints FW name/version, BLE MTU, events)
-                : n=0 Debug OFF
+  - M<n>        : MINSTART – Set minimum starting throttle (0..100)
+                  Applied ONLY when starting from stop.
+                  Does NOT prevent deceleration below it.
 
-  - ?           : State query (returns raw state text via notify; NO ACK/ERR wrapper)
-                Returns one of:
-                    STOPPED
-                    FORWARD <appliedThrottle>
-                    REVERSE <appliedThrottle>
-  - ??          : Hardware State query (returns raw state text via notify; NO ACK/ERR wrapper)
-                Returns one of:
-                    STOPPED
-                    FORWARD <appliedThrottle>
-                    REVERSE <appliedThrottle>
-  - G           : last 3 digits of the GUID
-  - V           : Version query (responds as ACK:<FW_VERSION>)
-                Example: V  ->  ACK:1.0.6
+  - K<t>,<ms>
+  - K<t>,<ms>,<rampDownMs>,<maxApply>
+
+                  t          = kick throttle (0..100)
+                  ms         = kick duration
+                  rampDownMs = kick ramp-down duration (optional)
+                  maxApply   = only kick if target ≤ maxApply (optional)
+
+                  When starting from stop and target > 0:
+                  - Applies max(t, MINSTART) for <ms>
+                  - Then transitions into ramp or quick-ramp behavior
+
+  --------------------------------------------------------------------------
+
+  DEBUG / DIAGNOSTICS
+
+  - D1          : Debug ON (Serial @115200)
+                  Prints FW name/version, BLE MTU, events, HW comparisons
+
+  - D0          : Debug OFF
+
+  - P0          : Periodic debug prints ONLY when hardware mismatch (default)
+
+  - P1          : Periodic debug prints every period (even if matching)
+
+  --------------------------------------------------------------------------
+
+  STATE QUERIES (RAW notify, no ACK wrapper)
+
+  - ?           : Hardware state query
+                  Returns one of:
+                      HW-STOPPED
+                      HW-FORWARD <percent>
+                      HW-REVERSE <percent>
+
+  - ??          : Stored/applied state query
+                  Returns one of:
+                      STOPPED
+                      FORWARD <appliedThrottle>
+                      REVERSE <appliedThrottle>
+
+  - G           : Returns last portion of SERVICE_UUID
+
+  - V           : Version query
+                  Responds as:
+                      ACK:<FW_VERSION>
 */
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <type_traits>
+#include <stdarg.h>
 
 // ------------------------- Startup defaults -------------------------
 static const bool DEBUG_AT_STARTUP = false;
 
 // ------------------------- Firmware ID -------------------------
 static const char* FW_NAME    = "GScaleThrottle";
-static const char* FW_VERSION = "1.0.9";
+static const char* FW_VERSION = "1.1.0";
 
 // ------------------------- BLE UUIDs (custom) -------------------------
 static const char* SERVICE_UUID = "9b2b7b30-5f3d-4a51-9bd6-1e8cde2c9000";
@@ -111,9 +145,9 @@ struct HwSnapshot {
 };
 
 // ------------------------- Pins & PWM -------------------------
-static const int PIN_RPWM = 25;   // Forward PWM -> RPWM
-static const int PIN_LPWM = 26;   // Reverse PWM -> LPWM
 static const int PIN_REN = 27;  // IBT-2 R_EN
+static const int PIN_LPWM = 26;   // Reverse PWM -> LPWM
+static const int PIN_RPWM = 25;   // Forward PWM -> RPWM
 static const int PIN_LEN = 33;  // IBT-2 L_EN
 static const uint32_t PWM_FREQ_HZ  = 20000;   // ~20kHz
 static const uint8_t  PWM_RES_BITS = 10;      // 8–10 bits allowed
@@ -131,7 +165,7 @@ static const int32_t P_SCALE = 1000; // mandatory
 static const uint32_t FULL_MOMENTUM_ACCEL_MS = 20000; // full-scale 100 step
 static const uint32_t FULL_MOMENTUM_DECEL_MS = 20000;
 static const uint32_t FULL_QUICKRAMP_ACCEL_MS = 2500; // 0->100 in 4s (tune)
-static const uint32_t FULL_QUICKRAMP_DECEL_MS = 2500; 
+static const uint32_t FULL_QUICKRAMP_DECEL_MS = 2500;
 static const uint32_t FULL_BRAKE_MS          = 10000;
 static const uint32_t FULL_QUICKSTOP_MS      = 3000;
 static const uint32_t DIR_CHANGE_DELAY_MS    = 2000;
@@ -144,6 +178,9 @@ static const bool DEBUG_PRINT_STORED_ONLY_ON_MISMATCH = false;
 // Pending reverse needs to remember which ramp constants to use after the delay
 static uint32_t pendingFullAccelMs = FULL_MOMENTUM_ACCEL_MS;
 static uint32_t pendingFullDecelMs = FULL_MOMENTUM_DECEL_MS;
+
+static bool pendingSkipDirDelay = false;
+static bool pendingSuppressKickOnce = false;
 
 // ------------------------- Motion/BLE state -------------------------
 static volatile bool debugMode = DEBUG_AT_STARTUP;
@@ -166,11 +203,22 @@ static RampKind rampKind = RampKind::NONE;
 static int32_t cfgMinStart = 0;
 static int32_t cfgKickThrottle = 0;
 static int32_t cfgKickMs = 0;
+static int32_t cfgKickRampDownMs = 80;     // default for 2-param K
+static int32_t cfgKickMaxApply   = 15;     // default for 2-param K
 
 static bool kickActive = false;
 static uint32_t kickEndMs = 0;
 static int32_t kickHoldThrottle = 0;
 static Direction kickDirection = Direction::STOP;
+
+// Post-kick continuation state (separate from reverse sequencing)
+static bool postKickPending = false;
+static Direction postKickDir = Direction::STOP;
+static int32_t postKickFinalThr = 0;
+static bool postKickIsInstant = false;
+static bool postKickIsMomentum = false;
+static uint32_t postKickFullAccelMs = FULL_MOMENTUM_ACCEL_MS;
+static uint32_t postKickFullDecelMs = FULL_MOMENTUM_DECEL_MS;
 
 // Reverse sequencing state
 static bool reversePending = false;
@@ -302,6 +350,7 @@ static inline void ledService() {
 static inline void cancelPendingReverse() {
   reversePending = false;
   pendingStage = PendingStage::NONE;
+  pendingSuppressKickOnce = false;
 }
 
 static inline int32_t clampI32(int32_t v, int32_t lo, int32_t hi) {
@@ -325,8 +374,42 @@ static uint32_t scaledDurationMs(uint32_t fullScaleMs, int32_t deltaThrottleAbs)
   return dur;
 }
 
+// ------------------------- Timestamped Debug Printing (ONE println per line) -------------------------
+static void dbgPrintf(const char* fmt, ...) {
+  if (!debugMode) return;
+
+  // NOTE: big lines (like [THR]) can be long; bump if you ever see truncation.
+  char line[768];
+  int n = 0;
+
+  uint32_t ms = millis();
+  uint32_t totalSeconds = ms / 1000UL;
+  uint32_t msec = ms % 1000UL;
+  uint32_t sec  = totalSeconds % 60UL;
+  uint32_t min  = (totalSeconds / 60UL) % 60UL;
+  uint32_t hour = (totalSeconds / 3600UL) % 24UL;
+
+  n = snprintf(line, sizeof(line),
+               "%02lu:%02lu:%02lu.%03lu -> ",
+               (unsigned long)hour,
+               (unsigned long)min,
+               (unsigned long)sec,
+               (unsigned long)msec);
+
+  if (n < 0 || (size_t)n >= sizeof(line)) return;
+
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, args);
+  va_end(args);
+
+  // Exactly ONE println to reduce interleaving across tasks
+  Serial.println(line);
+}
+
 static void debugPrintln(const String& s) {
-  if (debugMode) Serial.println(s);
+  if (!debugMode) return;
+  dbgPrintf("%s", s.c_str());
 }
 
 // ------------------------- Throttle change logging -------------------------
@@ -443,77 +526,48 @@ static void logThrottleChangeIfNeeded(const char* reason) {
   }
 
   if (!shouldPrint) {
-  // Even if we suppress printing, we must advance the baseline
-  // or "storedChanged" will remain true forever.
-  if (storedChanged) {
-    lastLoggedAppliedThrottle = appliedThrottle;
-    lastLoggedDirection = currentDirection;
-  }
+    // Even if we suppress printing, we must advance the baseline
+    // or "storedChanged" will remain true forever.
+    if (storedChanged) {
+      lastLoggedAppliedThrottle = appliedThrottle;
+      lastLoggedDirection = currentDirection;
+    }
     return;
   }
 
+  // Build deltas (for mismatch visibility)
+  Direction storedDir = (appliedThrottle <= 0 || currentDirection == Direction::STOP)
+                          ? Direction::STOP
+                          : currentDirection;
+  int32_t storedPct = clampI32(appliedThrottle, 0, 100);
+  int32_t dDir = (int32_t)((int)hw.hwDir - (int)storedDir);
+  int32_t dPct = (int32_t)(hw.hwThrottlePct - storedPct);
 
-  Serial.print("[THR] ");
-  Serial.print(reason);
-
-  if (!storedChanged && periodicDue) {
-    Serial.print(" (periodic)");
-  }
-
-  // --- STORED ---
-  Serial.print(" | STORED dir=");
-  Serial.print(dirStr(currentDirection));
-  Serial.print(" applied=");
-  Serial.print(appliedThrottle);
-  Serial.print(" targetDir=");
-  Serial.print(dirStr(targetDirection));
-  Serial.print(" target=");
-  Serial.print(targetThrottle);
-  Serial.print(" ramp=");
-  Serial.print(rampActive ? "1" : "0");
-  Serial.print(" kick=");
-  Serial.print(kickActive ? "1" : "0");
-  Serial.print(" pending=");
-  Serial.print(reversePending ? "1" : "0");
-  Serial.print(" ble=");
-  Serial.print(bleConnected ? "1" : "0");
-  Serial.print(" latch=");
-  Serial.print(forcedStopLatched ? "1" : "0");
-
-  // --- HW ---
-  Serial.print(" | HW EN=");
-  Serial.print(hw.enabled ? "1" : "0");
-  Serial.print(" (REN=");
-  Serial.print(hw.ren ? "1" : "0");
-  Serial.print(" LEN=");
-  Serial.print(hw.len ? "1" : "0");
-  Serial.print(")");
-  Serial.print(" dutyR=");
-  Serial.print(hw.dutyR);
-  Serial.print(" dutyL=");
-  Serial.print(hw.dutyL);
-  Serial.print(" hwDir=");
-  Serial.print(dirStr(hw.hwDir));
-  Serial.print(" hw%=");
-  Serial.print(hw.hwThrottlePct);
-
-  // --- Mismatch indicator + quick diff ---
-  Serial.print(" | ");
-  if (match) {
-    Serial.println("OK");
-  } else {
-    // Use the SAME expectation logic as hwMatchesStored()
-    Direction storedDir = (appliedThrottle <= 0 || currentDirection == Direction::STOP)
-                            ? Direction::STOP
-                            : currentDirection;
-    int32_t storedPct = clampI32(appliedThrottle, 0, 100);
-
-    Serial.print("MISMATCH");
-    Serial.print(" dDir=");
-    Serial.print((int)hw.hwDir - (int)storedDir);
-    Serial.print(" d%=");
-    Serial.println(hw.hwThrottlePct - storedPct);
-  }
+  dbgPrintf(
+    "[THR] %s%s | STORED dir=%s applied=%ld targetDir=%s target=%ld ramp=%d kick=%d pending=%d ble=%d latch=%d | "
+    "HW EN=%d (REN=%d LEN=%d) dutyR=%lu dutyL=%lu hwDir=%s hw%%=%ld | %s dDir=%ld d%%=%ld",
+    reason,
+    (!storedChanged && periodicDue) ? " (periodic)" : "",
+    dirStr(currentDirection),
+    (long)appliedThrottle,
+    dirStr(targetDirection),
+    (long)targetThrottle,
+    rampActive ? 1 : 0,
+    kickActive ? 1 : 0,
+    reversePending ? 1 : 0,
+    bleConnected ? 1 : 0,
+    forcedStopLatched ? 1 : 0,
+    hw.enabled ? 1 : 0,
+    hw.ren ? 1 : 0,
+    hw.len ? 1 : 0,
+    (unsigned long)hw.dutyR,
+    (unsigned long)hw.dutyL,
+    dirStr(hw.hwDir),
+    (long)hw.hwThrottlePct,
+    match ? "OK" : "MISMATCH",
+    (long)dDir,
+    (long)dPct
+  );
 
   // Update baseline only when stored state changed
   if (storedChanged) {
@@ -539,12 +593,7 @@ static inline void setTarget(Direction dir, int32_t thr, const String& reason) {
   targetThrottle  = thr;
 
   if (debugMode) {
-    Serial.print("[TGT] ");
-    Serial.print(reason);
-    Serial.print(" | targetDir=");
-    Serial.print(dirStr(targetDirection));
-    Serial.print(" target=");
-    Serial.println(targetThrottle);
+    dbgPrintf("[TGT] %s | targetDir=%s target=%ld", reason.c_str(), dirStr(targetDirection), (long)targetThrottle);
   }
 }
 
@@ -579,25 +628,50 @@ static void applyPwmOutputs(Direction dir, int32_t thr) {
   }
 }
 
-
 static void stopMotorNow(const char* reason) {
   setApplied(Direction::STOP, 0, reason);
   setTarget(Direction::STOP, 0, "stopMotorNow target");
 
+  // Stop any ramp
   rampActive = false;
   rampKind = RampKind::NONE;
+  rampStartMs = 0;
+  rampDurationMs = 0;
+  rampStartThrottle = 0;
+  rampTargetThrottle = 0;
+  rampDirection = Direction::STOP;
 
+  // Stop any kick + clear kick bookkeeping
   kickActive = false;
+  kickEndMs = 0;
+  kickHoldThrottle = 0;
+  kickDirection = Direction::STOP;
 
+  // Clear post-kick continuation
+  postKickPending = false;
+  postKickDir = Direction::STOP;
+  postKickFinalThr = 0;
+  postKickIsInstant = false;
+  postKickIsMomentum = false;
+  postKickFullAccelMs = FULL_MOMENTUM_ACCEL_MS;
+  postKickFullDecelMs = FULL_MOMENTUM_DECEL_MS;
+
+  // Clear any reverse sequencing
   reversePending = false;
   pendingStage = PendingStage::NONE;
+  pendingStageUntilMs = 0;
+  pendingFinalTargetThrottle = 0;
+  pendingFinalDirection = Direction::STOP;
+  pendingFinalIsInstant = false;
+  pendingFinalIsMomentum = false;
+  pendingSkipDirDelay = false;
+  pendingSuppressKickOnce = false;
 
   applyPwmOutputs(Direction::STOP, 0);
   driverEnable(false);  // TRUE STOP: coast/off
 
   if (debugMode) {
-    Serial.print("[STOP] ");
-    Serial.println(reason);
+    dbgPrintf("[STOP] %s", reason);
   }
 }
 
@@ -618,15 +692,15 @@ static String getHwStateString() {
   HwSnapshot hw = getHwSnapshot();
 
   if (hw.hwThrottlePct <= 0 || hw.hwDir == Direction::STOP) {
-    return "STOPPED";
+    return "HW-STOPPED";
   }
   if (hw.hwDir == Direction::FWD) {
-    return "FORWARD " + String(hw.hwThrottlePct);
+    return "HW-FORWARD " + String(hw.hwThrottlePct);
   }
   if (hw.hwDir == Direction::REV) {
-    return "REVERSE " + String(hw.hwThrottlePct);
+    return "HW-REVERSE " + String(hw.hwThrottlePct);
   }
-  return "STOPPED";
+  return "HW-STOPPED";
 }
 
 // ------------------------- MTU-aware BLE notify (chunked) -------------------------
@@ -688,12 +762,29 @@ static int32_t smoothstepEasedThrottle(int32_t startThr, int32_t targetThr, uint
 }
 
 static void cancelAllMotionActivities() {
+  // cancelAllMotionActivities() definition:
+  //
+  // Cancels any *active* time-based motion generators (ramp/kick) AND cancels any
+  // kick-related scheduled continuation (postKickPending).
+  //
+  // IMPORTANT ORDERING RULE:
+  // - If you need to start a ramp but also want a post-kick continuation afterward,
+  //   you MUST first transfer the continuation into reversePending/pendingFinal...,
+  //   because startRamp() calls cancelAllMotionActivities() and will clear postKickPending.
+
   rampActive = false;
   kickActive = false;
+
+  // If we cancel motion, also cancel any stored post-kick continuation
+  postKickPending = false;
+
   // Do NOT clear reversePending/pendingStage here (used for stop-first reversing).
 }
 
 static void startRamp(Direction dirDuringRamp, int32_t startThr, int32_t endThr, uint32_t durationMs, RampKind kind) {
+  // NOTE: startRamp() calls cancelAllMotionActivities().
+  // That will clear postKickPending (kick continuation staging).
+  // Always stage any post-kick continuation into pendingFinal... BEFORE calling startRamp().
   cancelAllMotionActivities();
 
   startThr = clampI32(startThr, 0, 100);
@@ -732,10 +823,20 @@ static bool shouldKickOnStart(bool startingFromStop, int32_t finalTargetThr) {
   if (!startingFromStop) return false;
   if (finalTargetThr <= 0) return false;
   if (cfgKickThrottle <= 0 || cfgKickMs <= 0) return false;
+
+  // only kick for low commanded values
+  if (finalTargetThr > cfgKickMaxApply) return false;
+
   return true;
 }
 
-static void beginKick(Direction dir, int32_t finalTargetThr, bool afterKickIsInstant, bool afterKickIsMomentum) {
+static void beginKick(Direction dir,
+                      int32_t finalTargetThr,
+                      bool afterKickIsInstant,
+                      bool afterKickIsMomentum,
+                      uint32_t accelMs,
+                      uint32_t decelMs)
+{
   int32_t kickThr = max(cfgKickThrottle, cfgMinStart);
   kickThr = clampI32(kickThr, 0, 100);
 
@@ -747,42 +848,79 @@ static void beginKick(Direction dir, int32_t finalTargetThr, bool afterKickIsIns
   setApplied(dir, kickHoldThrottle, "KICK begin");
   applyPwmOutputs(currentDirection, appliedThrottle);
 
-  reversePending = true;
-  pendingStage = PendingStage::NONE;
-  pendingFinalTargetThrottle = finalTargetThr;
-  pendingFinalDirection = dir;
-  pendingFinalIsInstant = afterKickIsInstant;
-  pendingFinalIsMomentum = afterKickIsMomentum;
+  // Store what to do after the kick finishes (DON'T reuse reversePending)
+  postKickPending = true;
+  postKickDir = dir;
+  postKickFinalThr = finalTargetThr;
+  postKickIsInstant = afterKickIsInstant;
+  postKickIsMomentum = afterKickIsMomentum;
+
+  // Preserve which ramp constants were active when the command was issued
+  postKickFullAccelMs = accelMs;
+  postKickFullDecelMs = decelMs;
 
   setTarget(dir, finalTargetThr, "KICK target");
 }
 
 static void continueAfterKickIfNeeded() {
-  if (!reversePending) return;
+  if (!postKickPending) return;
 
-  Direction dir = pendingFinalDirection;
-  int32_t thr = clampI32(pendingFinalTargetThrottle, 0, 100);
-  bool isInstant = pendingFinalIsInstant;
-  bool isMomentum = pendingFinalIsMomentum;
+  Direction dir = postKickDir;
+  int32_t finalThr = clampI32(postKickFinalThr, 0, 100);
 
-  reversePending = false;
+  // Done with "kick phase"
+  postKickPending = false;
 
-  if (isInstant) {
-    setApplied(dir, thr, "KICK -> instant");
+  // Recovery target:
+  // - Instant command: recover toward finalThr quickly
+  // - Ramped command: recover to 0 quickly, then let ramp engine handle inertia up to finalThr
+  const bool isInstant = postKickIsInstant;
+  int32_t recoverTo = isInstant ? finalThr : 0;
+
+  uint32_t rd = (uint32_t)cfgKickRampDownMs;
+
+  // ---- Stage continuation FIRST (for ramped commands only) ----
+  // IMPORTANT: do NOT set WAIT_DIR_DELAY yet. Let processRamp() arm it when we actually hit 0.
+  if (!isInstant) {
+    pendingFinalDirection = dir;
+    pendingFinalTargetThrottle = finalThr;
+    pendingFinalIsInstant = false;
+
+    // If Kick is agnostic. Preserve whatever motion type the original command requested.
+    // pendingFinalIsMomentum = postKickIsMomentum;
+    // If Kick is just a temporary override. The continuation behavior is deterministic.
+    pendingFinalIsMomentum = true;
+
+    pendingFullAccelMs = postKickFullAccelMs;
+    pendingFullDecelMs = postKickFullDecelMs;
+
+    pendingSkipDirDelay = true;     // no direction-delay for post-kick continuation
+    reversePending = true;
+    pendingStage = PendingStage::NONE;
+    pendingSuppressKickOnce = true;
+  }
+
+  // ---- Now perform the fast recovery ----
+  if (rd == 0) {
+    // Immediate recovery
+    setApplied(dir, recoverTo, "KICK recover immediate");
     applyPwmOutputs(currentDirection, appliedThrottle);
+
+    // If ramped command: we must manually arm the continuation because no ramp completion will occur
+    if (!isInstant && recoverTo == 0 && reversePending) {
+      pendingStage = PendingStage::WAIT_DIR_DELAY;
+      pendingStageUntilMs = millis();  // no delay
+      pendingSkipDirDelay = false;     // consume it here
+    }
+
     return;
   }
 
-  if (isMomentum) {
-    int32_t startThr = appliedThrottle;
-    int32_t deltaAbs = abs(thr - startThr);
-    uint32_t dur = scaledDurationMs(FULL_MOMENTUM_ACCEL_MS, deltaAbs);
-    startRamp(dir, startThr, thr, dur, RampKind::MOMENTUM);
-    return;
-  }
+  // Recovery ramp (nonzero duration). When it completes at 0, processRamp() will arm WAIT_DIR_DELAY.
+  startRamp(dir, appliedThrottle, recoverTo, rd, RampKind::QUICKSTOP);
 
-  setApplied(dir, thr, "KICK -> apply");
-  applyPwmOutputs(currentDirection, appliedThrottle);
+  // If it was an instant command, we're done after the recovery ramp completes.
+  // (No extra scheduling needed.)
 }
 
 // ------------------------- Motion command execution -------------------------
@@ -841,7 +979,11 @@ static void executeInstant(Direction dir, int32_t requestedThr) {
   setTarget(dir, effThr, "Instant effective target");
 
   if (shouldKickOnStart(startingFromStop, effThr)) {
-    beginKick(dir, effThr, /*afterKickIsInstant*/true, /*afterKickIsMomentum*/false);
+    beginKick(dir, effThr,
+      /*afterKickIsInstant*/true,
+      /*afterKickIsMomentum*/false,
+      /*accelMs*/0,
+      /*decelMs*/0);
     return;
   }
 
@@ -897,7 +1039,11 @@ static void executeRampedMove(Direction dir,
     pendingFullAccelMs = fullScaleAccelMs;
     pendingFullDecelMs = fullScaleDecelMs;
 
-    beginKick(dir, effTarget, /*afterKickIsInstant*/false, /*afterKickIsMomentum*/true);
+    beginKick(dir, effTarget,
+          /*afterKickIsInstant*/false,
+          /*afterKickIsMomentum*/true,
+          fullScaleAccelMs,
+          fullScaleDecelMs);
     return;
   }
 
@@ -950,8 +1096,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
 
     if (debugMode) {
-      Serial.print("[BLE] MTU=");
-      Serial.println(g_peerMtu);
+      dbgPrintf("[BLE] MTU=%u", (unsigned)g_peerMtu);
     }
   }
 
@@ -966,9 +1111,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     disconnectMs = millis();
 
     if (debugMode) {
-      Serial.print("[BLE] Disconnected, grace started (");
-      Serial.print(BLE_GRACE_MS);
-      Serial.println("ms)");
+      dbgPrintf("[BLE] Disconnected, grace started (%lums)", (unsigned long)BLE_GRACE_MS);
     }
 
     NimBLEDevice::startAdvertising();
@@ -996,22 +1139,21 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     upper.toUpperCase();
 
     if (debugMode) {
-      Serial.print("[CMD] ");
-      Serial.println(preserved);
+      dbgPrintf("[CMD] %s", preserved.c_str());
     }
 
     bool allowMotionNow = !(forcedStopLatched && !bleConnected);
 
     // STATE (no ACK, raw response only)
-    if (upper == "??") {
+    if (upper == "?") {
       bleNotifyChunked(getHwStateString());
       return;
     }
-    if (upper == "?") {
+    if (upper == "??") {
       bleNotifyChunked(getStateString());
       return;
     }
-  
+
     // VERSION
     if (upper == "V") {
       sendACK(String(FW_VERSION));
@@ -1037,16 +1179,12 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       lastLoggedAppliedThrottle = -9999;
       lastLoggedDirection = (Direction)255;
 
-      Serial.println("[DEBUG] ON");
-      Serial.print("[FW] ");
-      Serial.print(FW_NAME);
-      Serial.print(" v");
-      Serial.println(FW_VERSION);
-      Serial.println("[BOOT] ready");
+      dbgPrintf("[DEBUG] ON");
+      dbgPrintf("[FW] %s v%s", FW_NAME, FW_VERSION);
+      dbgPrintf("[BOOT] ready");
 
       if (bleConnected) {
-        Serial.print("[BLE] MTU=");
-        Serial.println(g_peerMtu);
+        dbgPrintf("[BLE] MTU=%u", (unsigned)g_peerMtu);
       }
 
       // Force initial state print
@@ -1062,13 +1200,13 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     }
 
     // PERIODIC PRINT CONTROL
-    // P1 = periodic prints ONLY when mismatch (default behavior)
-    // P0 = periodic prints every period (even if OK)
+    // P0 = periodic prints ONLY when mismatch (default behavior)
+    // P1 = periodic prints every period (even if OK)
     if (upper == "P0") {
       printPeriodic = true;
 
       if (debugMode) {
-        Serial.println("[CFG] Periodic prints: ONLY ON MISMATCH");
+        dbgPrintf("[CFG] Periodic prints: ONLY ON MISMATCH");
       }
 
       sendACK(preserved);
@@ -1079,7 +1217,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       printPeriodic = false;
 
       if (debugMode) {
-        Serial.println("[CFG] Periodic prints: ALWAYS (every period)");
+        dbgPrintf("[CFG] Periodic prints: ALWAYS (every period)");
       }
 
       sendACK(preserved);
@@ -1092,32 +1230,54 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       nStr.trim();
       if (!isDigitStr(nStr)) { sendERR(preserved); return; }
       cfgMinStart = clampI32(nStr.toInt(), 0, 100);
-      if (debugMode) { Serial.print("[CFG] M="); Serial.println(cfgMinStart); }
+      if (debugMode) {
+        dbgPrintf("[CFG] M=%ld", (long)cfgMinStart);
+      }
       sendACK(preserved);
       return;
     }
 
-    // KICK<t>,<ms>
+    // KICK<t>,<ms>[,<rampDownMs>,<maxApply>]
     if (upper.startsWith("K")) {
       String args = original.substring(1);
       args.trim();
-      int comma = args.indexOf(',');
-      if (comma < 0) { sendERR(preserved); return; }
 
-      String tStr  = args.substring(0, comma);
-      String msStr = args.substring(comma + 1);
-      tStr.trim(); msStr.trim();
+      // Tokenize by comma (max 4 tokens)
+      String tok[4];
+      int tokCount = 0;
 
-      if (!isDigitStr(tStr) || !isDigitStr(msStr)) { sendERR(preserved); return; }
+      while (tokCount < 4) {
+        int comma = args.indexOf(',');
+        if (comma < 0) { tok[tokCount++] = args; break; }
+        tok[tokCount++] = args.substring(0, comma);
+        args = args.substring(comma + 1);
+        args.trim();
+      }
 
-      cfgKickThrottle = clampI32(tStr.toInt(), 0, 100);
-      cfgKickMs       = clampI32(msStr.toInt(), 0, 2000);
+      if (tokCount != 2 && tokCount != 4) { sendERR(preserved); return; }
+
+      for (int i = 0; i < tokCount; i++) tok[i].trim();
+
+      if (!isDigitStr(tok[0]) || !isDigitStr(tok[1])) { sendERR(preserved); return; }
+
+      cfgKickThrottle = clampI32(tok[0].toInt(), 0, 100);
+      cfgKickMs       = clampI32(tok[1].toInt(), 0, 2000);
+
+      if (tokCount == 4) {
+        if (!isDigitStr(tok[2]) || !isDigitStr(tok[3])) { sendERR(preserved); return; }
+        cfgKickRampDownMs = clampI32(tok[2].toInt(), 0, 2000);
+        cfgKickMaxApply   = clampI32(tok[3].toInt(), 0, 100);
+      } else {
+        cfgKickRampDownMs = 80;
+        cfgKickMaxApply   = 15;
+      }
 
       if (debugMode) {
-        Serial.print("[CFG] KICK=");
-        Serial.print(cfgKickThrottle);
-        Serial.print(",");
-        Serial.println(cfgKickMs);
+        dbgPrintf("[CFG] KICK=%ld,%ld rd=%ld max=%ld",
+                  (long)cfgKickThrottle,
+                  (long)cfgKickMs,
+                  (long)cfgKickRampDownMs,
+                  (long)cfgKickMaxApply);
       }
 
       sendACK(preserved);
@@ -1148,7 +1308,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 
       if (allowMotionNow) {
         if (forcedStopLatched && bleConnected) forcedStopLatched = false;
-        //executeInstant(upper.startsWith("FQ") ? Direction::FWD : Direction::REV, n);
+        // executeInstant(upper.startsWith("FQ") ? Direction::FWD : Direction::REV, n);
         executeQuickRamp(upper.startsWith("FQ") ? Direction::FWD : Direction::REV, n);
       } else {
         stopMotorNow("Forced-stop latched; motion ignored until reconnect");
@@ -1189,19 +1349,18 @@ static void setupPwm() {
   ledcSetup(PWM_CH_L, PWM_FREQ_HZ, PWM_RES_BITS);
   ledcAttachPin(PIN_RPWM, PWM_CH_R);
   ledcAttachPin(PIN_LPWM, PWM_CH_L);
-  pwmInitialized = true; 
+  pwmInitialized = true;
   applyPwmOutputs(Direction::STOP, 0);
 
   if (debugMode) {
-    Serial.print("[PWM] init ok, dutyR=");
-    Serial.print(ledcRead(PWM_CH_R));
-    Serial.print(" dutyL=");
-    Serial.println(ledcRead(PWM_CH_L));
+    dbgPrintf("[PWM] init ok, dutyR=%lu dutyL=%lu",
+              (unsigned long)ledcRead(PWM_CH_R),
+              (unsigned long)ledcRead(PWM_CH_L));
   }
 }
 
 static void setupDriverPins() {
-  //Configure EN pins ----
+  // Configure EN pins ----
   pinMode(PIN_REN, OUTPUT);
   pinMode(PIN_LEN, OUTPUT);
   driverEnable(false);   // Start DISABLED (true coast/off)
@@ -1248,12 +1407,9 @@ void setup() {
     lastLoggedAppliedThrottle = -9999;
     lastLoggedDirection = (Direction)255;
 
-    Serial.println("[DEBUG] ON (startup)");
-    Serial.print("[FW] ");
-    Serial.print(FW_NAME);
-    Serial.print(" v");
-    Serial.println(FW_VERSION);
-    Serial.println("[BOOT] ready");
+    dbgPrintf("[DEBUG] ON (startup)");
+    dbgPrintf("[FW] %s v%s", FW_NAME, FW_VERSION);
+    dbgPrintf("[BOOT] ready");
   }
 
   setupBle();
@@ -1291,9 +1447,10 @@ static void processRamp() {
       applyPwmOutputs(currentDirection, appliedThrottle);
     }
 
-    if (reversePending && appliedThrottle == 0) {
+    if (reversePending && (rampTargetThrottle == 0)) {
       pendingStage = PendingStage::WAIT_DIR_DELAY;
-      pendingStageUntilMs = millis() + DIR_CHANGE_DELAY_MS;
+      pendingStageUntilMs = millis() + (pendingSkipDirDelay ? 0 : DIR_CHANGE_DELAY_MS);
+      pendingSkipDirDelay = false;
     }
   }
 }
@@ -1307,6 +1464,10 @@ static void processPendingReverse() {
 
   pendingStage = PendingStage::NONE;
 
+  // Consume one-shot suppression immediately so it can't stick.
+  const bool suppressKick = pendingSuppressKickOnce;
+  pendingSuppressKickOnce = false;
+
   Direction dir = pendingFinalDirection;
   int32_t thr = clampI32(pendingFinalTargetThrottle, 0, 100);
 
@@ -1315,29 +1476,29 @@ static void processPendingReverse() {
 
   setTarget(dir, effThr, "Reverse complete target");
 
-  if (shouldKickOnStart(startingFromStop, effThr)) {
-    beginKick(dir, effThr, pendingFinalIsInstant, pendingFinalIsMomentum);
+  if (!suppressKick && shouldKickOnStart(startingFromStop, effThr)) {
+    beginKick(dir, effThr,
+      pendingFinalIsInstant,
+      pendingFinalIsMomentum,
+      pendingFullAccelMs,
+      pendingFullDecelMs);
     return;
   }
 
   reversePending = false;
 
-  // ----- Instant after reverse -----
   if (pendingFinalIsInstant) {
     setApplied(dir, effThr, "Reverse complete -> instant");
     applyPwmOutputs(currentDirection, appliedThrottle);
     return;
   }
 
-  // ----- Momentum after reverse -----
   if (pendingFinalIsMomentum) {
-    // Use the ramp constants that were active when the command was issued (momentum vs quick ramp)
     uint32_t dur = scaledDurationMs(pendingFullAccelMs, abs(effThr));
     startRamp(dir, 0, effThr, dur, RampKind::MOMENTUM);
     return;
   }
 
-  // ----- Fallback direct apply -----
   setApplied(dir, effThr, "Reverse complete -> apply");
   applyPwmOutputs(currentDirection, appliedThrottle);
 }
@@ -1378,9 +1539,7 @@ static void processBleGrace() {
       uint32_t elapsed = now - disconnectMs;
       uint32_t remaining = (elapsed >= BLE_GRACE_MS) ? 0 : (BLE_GRACE_MS - elapsed);
 
-      Serial.print("[BLE] Grace countdown: ");
-      Serial.print(remaining);
-      Serial.println("ms remaining");
+      dbgPrintf("[BLE] Grace countdown: %lums remaining", (unsigned long)remaining);
     }
   } else {
     // If debug is off, don't keep stale primed state
@@ -1406,7 +1565,7 @@ static void processBleGrace() {
     executeStopRamp(RampKind::QUICKSTOP);
 
     if (debugMode) {
-      Serial.println("[BLE] Grace expired: forced stop latched");
+      dbgPrintf("[BLE] Grace expired: forced stop latched");
     }
   }
 }
