@@ -410,4 +410,85 @@ Common ground is mandatory.
 
 ---
 
+Absolutely — here’s a **full “wire-it-now” table** for your **final v1.0.9 firmware**, including the **recommended 10k pulldowns** on the EN pins.
+
+Assumptions (match what we’ve been doing):
+
+* **15V Bus** is your black-box supply (15.3V nominal)
+* ESP32 is powered from the **buck USB-C**
+* IBT-2 logic **VCC** is fed from ESP32 **VIN (USB 5V rail)** (you measured ~4.96V there)
+* Control pins per your code:
+
+  * **RPWM = GPIO25**
+  * **LPWM = GPIO26**
+  * **R_EN = GPIO27**
+  * **L_EN = GPIO33**
+
+---
+## 17 Wiring
+
+## 17.1 Full Wiring Table
+
+| Source                      | Connected to                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------------ |
+| **IBT2 B+**                 | **15V Bus +** (through your fuse is recommended)                                     |
+| **IBT2 B-**                 | **15V Bus -**                                                                        |
+| **IBT2 M+**                 | **Motor lead 1** *(or 1k load to IBT2 M- during bench test)*                         |
+| **IBT2 M-**                 | **Motor lead 2** *(or 1k load to IBT2 M+ during bench test)*                         |
+| **IBT2 GND (header GND)**   | **ESP32 GND**                                                                        |
+| **IBT2 VCC (header VCC)**   | **ESP32 VIN (5V rail from USB)**                                                     |
+| **IBT2 R_EN (header R_EN)** | **ESP32 GPIO27**                                                                     |
+| **IBT2 L_EN (header L_EN)** | **ESP32 GPIO33**                                                                     |
+| **IBT2 RPWM (header RPWM)** | **ESP32 GPIO25**                                                                     |
+| **IBT2 LPWM (header LPWM)** | **ESP32 GPIO26**                                                                     |
+| **ESP32 GND**               | **Buck -** *(and therefore 15V Bus - via buck input)*                                |
+| **ESP32 VIN**               | **IBT2 VCC** *(this is a “distribution point” — VIN is powered internally from USB)* |
+| **ESP32 GPIO25**            | **IBT2 RPWM**                                                                        |
+| **ESP32 GPIO26**            | **IBT2 LPWM**                                                                        |
+| **ESP32 GPIO27**            | **IBT2 R_EN**                                                                        |
+| **ESP32 GPIO33**            | **IBT2 L_EN**                                                                        |
+| **ESP32 USB-C port**        | **Buck USB-C output**                                                                |
+| **Buck + (input red)**      | **15V Bus +**                                                                        |
+| **Buck - (input black)**    | **15V Bus -**                                                                        |
+| **Buck USB (output)**       | **ESP32 USB-C port**                                                                 |
+
+---
+
+## 17.2 Strongly Recommended “Boot-Safe” Resistors (do these)
+
+These make sure the IBT-2 stays **disabled during ESP32 reset/boot**.
+
+| Part                         | Connected to                   |
+| ---------------------------- | ------------------------------ |
+| **10k pulldown resistor #1** | **IBT2 R_EN → 10k → IBT2 GND** |
+| **10k pulldown resistor #2** | **IBT2 L_EN → 10k → IBT2 GND** |
+
+(You can connect to IBT2 GND header pin or any ground point that’s common with ESP32 GND.)
+
+---
+
+## 17.3 Optional but Recommended Power Noise Parts (later, but good)
+
+| Part                          | Connected to                                      |
+| ----------------------------- | ------------------------------------------------- |
+| **470µF electrolytic (25V+)** | **Across IBT2 B+ and IBT2 B-** close to IBT-2     |
+| **220µF electrolytic (10V+)** | **Across ESP32 VIN and ESP32 GND** close to ESP32 |
+
+---
+
+## 17.4 “Bench Test Mode” Wiring (before motor)
+
+To reproduce clean testing like we did:
+
+| Source      | Connected to               |
+| ----------- | -------------------------- |
+| **IBT2 M+** | **1k resistor to IBT2 M-** |
+| **IBT2 M-** | **1k resistor to IBT2 M+** |
+
+Then you can measure **M+ → M-** at:
+
+* STOP: should now go ~0V (because firmware disables EN at thr=0)
+* FQ100: should show a real voltage (and vary with throttle)
+
+
 **END OF MANUAL — REVISION 1.3**
